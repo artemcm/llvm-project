@@ -1,0 +1,59 @@
+Name: SliceCollapse
+Functions:
+  - Name: collapseName
+    SwiftName: 'nameUnversioned()'
+  - Name: collapseSafety
+    SwiftSafety: safe
+  - Name: collapsePrivate
+    SwiftPrivate: true
+  - Name: collapseParam
+    Parameters:
+      - Position: 0
+        NoEscape: true
+  - Name: collapseBadAlias
+    SwiftPrivate: true
+  - Name: collapseBadBase
+    SwiftName: 'badBase(x:)'
+  - Name: collapseUbu
+    UnsafeBufferUsage: true
+Classes:
+  - Name: CollapseBox
+    Methods:
+      - Selector: 'collapseMethod:'
+        MethodKind: Instance
+        Parameters:
+          - Position: 0
+            NoEscape: true
+Tags:
+  - Name: collapseOrder
+    SwiftBridge: 'Bridged'
+    SwiftConformsTo: 'Swift.Equatable'
+SwiftVersions:
+  - Version: 4.0
+    Functions:
+      - Name: collapseName
+        SwiftName: 'nameV4()'
+      - Name: collapseSafety
+        SwiftSafety: unsafe
+      - Name: collapseUnavail
+        SwiftPrivate: true
+      - Name: collapsePrivate
+        SwiftPrivate: false
+      - Name: collapseRetain
+        RetainCountConvention: none
+      - Name: collapseParam
+        Parameters:
+          - Position: 0
+            NoEscape: false
+      - Name: collapseBadName
+        SwiftName: 'badName(x:)'
+      - Name: collapseBadAlias
+        SwiftName: 'badAlias(x:)'
+      - Name: collapseBadBase
+        SwiftName: 'goodFour()'
+      - Name: collapseUbu
+        UnsafeBufferUsage: true
+      - Name: collapseSafetyOther
+        SwiftSafety: unsafe
+      - Name: collapseAvailPlatform
+        Availability: nonswift

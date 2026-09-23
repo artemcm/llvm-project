@@ -14,6 +14,7 @@
 //===----------------------------------------------------------------------===//
 #include "clang/APINotes/APINotesReader.h"
 #include "APINotesFormat.h"
+#include "clang/APINotes/APINotesManager.h"
 #include "clang/APINotes/Types.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Hashing.h"
@@ -2266,7 +2267,7 @@ APINotesReader::VersionedInfo<T>::VersionedInfo(
 
   Selected = std::nullopt;
   for (unsigned i = 0, n = Results.size(); i != n; ++i) {
-    if (!Version.empty() && Results[i].first >= Version) {
+    if (isSliceSelectable(Results[i].first, Version)) {
       // If the current version is "4", then entries for 4 are better than
       // entries for 5, but both are valid. Because entries are sorted, we get
       // that behavior by picking the first match.

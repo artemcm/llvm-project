@@ -58,6 +58,10 @@ module Templates {
   header "Templates.h"
 }
 
+module SliceCollapse {
+  header "SliceCollapse.h"
+}
+
 module SwiftImportAs {
   header "SwiftImportAs.h"
 }
