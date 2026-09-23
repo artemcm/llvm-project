@@ -8,7 +8,8 @@
 //   methodProbe            ...and on a method.
 //   auditedProbe           'Nullability:' and 'NullabilityOfRet:' together.
 //   RecProbe               'Type:' on a field.
-//   propProbe              'Type:' and 'Nullability:' on a property.
+//   propProbe              'Type:' and 'Nullability:' on a property, which its
+//                          implicit getter returns and its setter takes.
 //
 // The -Wnonnull diagnostics are what a consumer sees of all this.
 
@@ -42,6 +43,11 @@
 // V4: ParmVarDecl {{.*}} p 'id'
 // V4: Dumping TyBox::propProbe:
 // V4: ObjCPropertyDecl {{.*}} propProbe 'TyBox *'
+// V4: Dumping TyBox::propProbe:
+// V4: ObjCMethodDecl {{.*}} propProbe 'TyBox *'
+// V4: Dumping TyBox::setPropProbe::
+// V4: ObjCMethodDecl {{.*}} setPropProbe: 'void'
+// V4: ParmVarDecl {{.*}} propProbe 'TyBox *'
 
 // V5: Dumping varProbe:
 // V5: VarDecl {{.*}} varProbe 'int * _Nonnull':'int *'
@@ -61,6 +67,11 @@
 // V5: ParmVarDecl {{.*}} p 'id _Nonnull':'id'
 // V5: Dumping TyBox::propProbe:
 // V5: ObjCPropertyDecl {{.*}} propProbe 'id _Nonnull':'id'
+// V5: Dumping TyBox::propProbe:
+// V5: ObjCMethodDecl {{.*}} propProbe 'id _Nonnull':'id'
+// V5: Dumping TyBox::setPropProbe::
+// V5: ObjCMethodDecl {{.*}} setPropProbe: 'void'
+// V5: ParmVarDecl {{.*}} propProbe 'id _Nonnull':'id'
 
 //--- module.modulemap
 module TyKit { header "TyKit.h" export * }
@@ -141,6 +152,7 @@ void use(TyBox *box) {
   (void)resultProbe();
   (void)[box methodProbe:0]; // v5-warning {{null passed to a callee that requires a non-null argument}}
   (void)box.propProbe;
+  box.propProbe = 0; // v5-warning {{null passed to a callee that requires a non-null argument}}
   struct RecProbe r;
   (void)r;
 }
