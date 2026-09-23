@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SemaAPINotesInternal.h"
 #include "clang/AST/ASTMutationListener.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/ExprCXX.h"
@@ -2321,6 +2322,24 @@ static void AddPropertyAttrs(Sema &S, ObjCMethodDecl *PropertyMethod,
         isa<AvailabilityAttr>(A))
       PropertyMethod->addAttr(A->clone(S.Context));
   }
+
+  // Under -fswift-version-independent-apinotes the property's API notes are
+  // captured rather than applied, so the accessor gets the slices that would
+  // have set those attributes, and applies them when it is collapsed. So too
+  // for the property's type, which the getter returns and the setter takes.
+  auto IsType = [](attr::Kind K) {
+    return K == attr::SwiftType || K == attr::SwiftNullability;
+  };
+  if (PropertyMethod->param_size() == 0) {
+    propagateCapturedAPINotes(S, PropertyMethod, Property, [&](attr::Kind K) {
+      return isAvailabilityAttrKind(K) || IsType(K);
+    });
+    return;
+  }
+  propagateCapturedAPINotes(S, PropertyMethod, Property,
+                            isAvailabilityAttrKind);
+  propagateCapturedAPINotes(S, PropertyMethod->parameters()[0], Property,
+                            IsType);
 }
 
 /// ProcessPropertyDecl - Make sure that any user-defined setter/getter methods

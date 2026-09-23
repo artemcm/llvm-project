@@ -98,6 +98,22 @@ struct APINotesSelectorDiagnosticState {
   void diagnoseUnused(Sema &S) const;
 };
 
+/// Pass the API notes slices captured on \p Property on to \p Accessor, one of
+/// its implicit accessors or the setter's parameter, under
+/// -fswift-version-independent-apinotes, for the annotations AddPropertyAttrs
+/// or accessor synthesis would pass on: those of a kind \p Copies accepts.
+///
+/// \returns Whether anything was added to \p Accessor.
+bool propagateCapturedAPINotes(Sema &S, Decl *Accessor, const Decl *Property,
+                               llvm::function_ref<bool(attr::Kind)> Copies);
+
+/// Whether \p K is one of the availability kinds that inheritance and accessor
+/// synthesis copy together: deprecated, unavailable and availability.
+inline bool isAvailabilityAttrKind(attr::Kind K) {
+  return K == attr::Deprecated || K == attr::Unavailable ||
+         K == attr::Availability;
+}
+
 /// Whether Sema should infer an attribute of kind \p Kind on \p D, now that
 /// API notes have applied: not if D's attributes suppress it. Under
 /// -fswift-version-independent-apinotes this also records the decision, which

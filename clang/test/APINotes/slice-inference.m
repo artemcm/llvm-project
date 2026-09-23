@@ -9,6 +9,8 @@
 //                   that, so at 4 the inference the producer skipped happens.
 //   auditedProbe    inside an audited region a function is inferred to be
 //                   audited, unless the 4.0 slice makes it cf_unknown_transfer.
+//   goneProbe       a property's implicit accessors get copies of its
+//                   availability as it stands once API notes apply.
 //
 // Everything runs against both modes. The IR checks are the ones that matter:
 // a caller retains or not by the attributes it sees.
@@ -39,6 +41,19 @@
 // V4-NEXT: NSReturnsNotRetainedAttr
 // V4-NEXT: NSReturnsRetainedAttr {{.*}} Implicit
 // V4-EMPTY:
+// V4-NEXT: Dumping InfThing::goneProbe:
+// V4-NEXT: ObjCPropertyDecl {{.*}} goneProbe
+// V4-NEXT: UnavailableAttr {{.*}} "gone"
+// V4-EMPTY:
+// V4-NEXT: Dumping InfThing::goneProbe:
+// V4-NEXT: ObjCMethodDecl {{.*}} implicit - goneProbe
+// V4-NEXT: UnavailableAttr {{.*}} "gone"
+// V4-EMPTY:
+// V4-NEXT: Dumping InfThing::setGoneProbe::
+// V4-NEXT: ObjCMethodDecl {{.*}} implicit - setGoneProbe:
+// V4-NEXT: ParmVarDecl
+// V4-NEXT: UnavailableAttr {{.*}} "gone"
+// V4-EMPTY:
 
 // V5: Dumping auditedProbe:
 // V5-NEXT: FunctionDecl {{.*}} auditedProbe
@@ -56,6 +71,18 @@
 // V5-NEXT: ObjCMethodDecl {{.*}} + newHeaderProbe
 // V5-NEXT: NSReturnsNotRetainedAttr
 // V5-NEXT: SwiftVersionedRemovalAttr {{.*}} Implicit 4.0 {{[0-9]+}} 0{{$}}
+// V5-EMPTY:
+// V5-NEXT: Dumping InfThing::goneProbe:
+// V5-NEXT: ObjCPropertyDecl {{.*}} goneProbe
+// V5-NEXT: SwiftVersionedAdditionAttr {{.*}} Implicit 4.0 0{{$}}
+// V5-NEXT: UnavailableAttr {{.*}} "gone"
+// V5-EMPTY:
+// V5-NEXT: Dumping InfThing::goneProbe:
+// V5-NEXT: ObjCMethodDecl {{.*}} implicit - goneProbe
+// V5-EMPTY:
+// V5-NEXT: Dumping InfThing::setGoneProbe::
+// V5-NEXT: ObjCMethodDecl {{.*}} implicit - setGoneProbe:
+// V5-NEXT: ParmVarDecl
 // V5-EMPTY:
 
 // At 4 newProbe returns +0 and newHeaderProbe +1; at 5 the other way round.
@@ -82,6 +109,7 @@ __attribute__((objc_root_class))
 @interface InfThing
 + (id)newProbe;
 + (id)newHeaderProbe __attribute__((ns_returns_not_retained));
+@property (nonatomic, assign) int goneProbe;
 @end
 
 //--- InfKit.apinotes
@@ -100,6 +128,10 @@ SwiftVersions:
           - Selector: newHeaderProbe
             MethodKind: Class
             RetainCountConvention: none
+        Properties:
+          - Name: goneProbe
+            Availability: none
+            AvailabilityMsg: 'gone'
 
 //--- use.m
 @import InfKit;
