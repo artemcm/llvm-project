@@ -10,6 +10,7 @@
 #define LLVM_CLANG_LIB_SEMA_SEMAAPINOTESINTERNAL_H
 
 #include "clang/APINotes/Types.h"
+#include "clang/Basic/AttrKinds.h"
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -20,6 +21,7 @@
 #include <utility>
 
 namespace clang {
+class Decl;
 class Sema;
 struct APINotesParameterSelectorCandidates;
 namespace api_notes {
@@ -92,6 +94,13 @@ struct APINotesSelectorDiagnosticState {
 
   void diagnoseUnused(Sema &S) const;
 };
+
+/// Whether Sema should infer an attribute of kind \p Kind on \p D, now that
+/// API notes have applied: not if D's attributes suppress it. Under
+/// -fswift-version-independent-apinotes this also records the decision, which
+/// the collapse makes again once it has applied the slices. Call it just
+/// before adding the inferred attribute.
+bool inferAfterAPINotes(Sema &S, Decl *D, attr::Kind Kind);
 
 } // namespace clang
 
