@@ -661,6 +661,15 @@ public:
     return !isCompilingModule() && !ModuleName.empty();
   }
 
+  /// Does this compilation capture API notes for every Swift version, leaving
+  /// its importers to select and apply them? Only a module or PCH build under
+  /// -fswift-version-independent-apinotes does. A translation unit has a single
+  /// Swift version, so it applies API notes even with the flag.
+  bool capturesVersionIndependentAPINotes() const {
+    return SwiftVersionIndependentAPINotes &&
+           (isCompilingModule() || CompilingPCH);
+  }
+
   /// Do we need to track the owning module for a local declaration?
   bool trackLocalOwningModule() const {
     return isCompilingModule() || ModulesLocalVisibility;

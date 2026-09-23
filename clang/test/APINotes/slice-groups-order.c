@@ -17,36 +17,45 @@
 // slice-groups.c covers two readers with no selector, and slice-groups-exact.c
 // covers one reader with a selector. Neither pins the order, because with a
 // single pair any numbering is ascending.
+//
+// Under -fswift-version-independent-apinotes the module build captures every
+// slice and this translation unit collapses them at its own version. The bar
+// is the default mode, so each check runs against both with the same
+// expectations.
 
 // RUN: rm -rf %t && mkdir -p %t
-// RUN: %clang_cc1 -fswift-version-independent-apinotes -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/ModulesCache -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupOrderProbe -x c | FileCheck %s
+
+// RUN: %clang_cc1 -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/def-none -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupOrderProbe -x c | FileCheck --check-prefix=NOVERSION %s
+// RUN: %clang_cc1 -fswift-version-independent-apinotes -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/cap-none -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupOrderProbe -x c | FileCheck --check-prefix=NOVERSION %s
+
+// At Swift 3 group 0's 3.0 slice wins, and is displaced in turn.
+// RUN: %clang_cc1 -fapinotes-swift-version=3 -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/def-v3 -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupOrderProbe -x c | FileCheck --check-prefix=V3 %s
+// RUN: %clang_cc1 -fswift-version-independent-apinotes -fapinotes-swift-version=3 -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/cap-v3 -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupOrderProbe -x c | FileCheck --check-prefix=V3 %s
 
 #include "ExportAs.h"
 
-// CHECK: Dumping sliceGroupOrderProbe:
-// CHECK: FunctionDecl {{.+}} imported in ExportAsCore sliceGroupOrderProbe
+// Each group's winner displaces the previous group's, and each displaced name
+// is re-wrapped under the group that displaced it: 0, 1, 2 and 3 in turn. The
+// live name is group 3's, ExportAs's parameter-selector lookup, because it was
+// applied last.
+// NOVERSION: Dumping sliceGroupOrderProbe:
+// NOVERSION: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 0{{$}}
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "coreBroadV3(_:)"
+// NOVERSION-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 IsReplacedByActive 1{{$}}
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "coreBroad(_:)"
+// NOVERSION-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 IsReplacedByActive 2{{$}}
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "coreExact(_:)"
+// NOVERSION-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 IsReplacedByActive 3{{$}}
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "exportBroad(_:)"
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "exportExact(_:)"
 
-// Group 0: ExportAsCore's broad lookup, with an unversioned and a 3.0 slice.
-// CHECK: SwiftVersionedSliceAttr {{.+}} Implicit 0 0{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 0{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "coreBroad(_:)"
-// CHECK-NEXT: SwiftVersionedSliceAttr {{.+}} Implicit 3.0 0{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 0{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "coreBroadV3(_:)"
-
-// Group 1: ExportAsCore's parameter-selector lookup. Odd, and adjacent to its
-// own reader's broad group rather than pooled with the other reader's.
-// CHECK-NEXT: SwiftVersionedSliceAttr {{.+}} Implicit 0 1{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 1{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "coreExact(_:)"
-
-// Group 2: ExportAs's broad lookup, reached through export_as.
-// CHECK-NEXT: SwiftVersionedSliceAttr {{.+}} Implicit 0 2{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 2{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "exportBroad(_:)"
-
-// Group 3: ExportAs's parameter-selector lookup. Applied last, so under the
-// legacy selection this is the name that would win.
-// CHECK-NEXT: SwiftVersionedSliceAttr {{.+}} Implicit 0 3{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 3{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "exportExact(_:)"
+// V3: Dumping sliceGroupOrderProbe:
+// V3: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 IsReplacedByActive 0{{$}}
+// V3-NEXT: SwiftNameAttr {{.+}} "coreBroad(_:)"
+// V3-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 IsReplacedByActive 1{{$}}
+// V3-NEXT: SwiftNameAttr {{.+}} "coreBroadV3(_:)"
+// V3-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 IsReplacedByActive 2{{$}}
+// V3-NEXT: SwiftNameAttr {{.+}} "coreExact(_:)"
+// V3-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 IsReplacedByActive 3{{$}}
+// V3-NEXT: SwiftNameAttr {{.+}} "exportBroad(_:)"
+// V3-NEXT: SwiftNameAttr {{.+}} "exportExact(_:)"

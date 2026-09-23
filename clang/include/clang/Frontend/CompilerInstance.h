@@ -334,6 +334,16 @@ public:
     return Invocation->getAPINotesOpts();
   }
 
+  /// The Swift version at which this compilation's AST readers apply API notes
+  /// captured by -fswift-version-independent-apinotes, or std::nullopt if the
+  /// compilation captures API notes itself and so must leave them captured.
+  /// See ASTReader::setAPINotesSwiftVersion.
+  std::optional<llvm::VersionTuple> getAPINotesCollapseVersion() const {
+    if (getLangOpts().capturesVersionIndependentAPINotes())
+      return std::nullopt;
+    return getAPINotesOpts().SwiftVersion;
+  }
+
   LangOptions &getLangOpts() { return Invocation->getLangOpts(); }
   const LangOptions &getLangOpts() const { return Invocation->getLangOpts(); }
 
@@ -775,7 +785,8 @@ public:
       ArrayRef<std::shared_ptr<ModuleFileExtension>> Extensions,
       ArrayRef<std::shared_ptr<DependencyCollector>> DependencyCollectors,
       void *DeserializationListener, bool OwnDeserializationListener,
-      bool Preamble, bool UseGlobalModuleIndex);
+      bool Preamble, bool UseGlobalModuleIndex,
+      std::optional<llvm::VersionTuple> APINotesSwiftVersion);
 
   /// Create a code completion consumer using the invocation; note that this
   /// will cause the source manager to truncate the input source file at the

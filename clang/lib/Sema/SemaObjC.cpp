@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Sema/SemaObjC.h"
+#include "SemaAPINotesInternal.h"
 #include "clang/AST/ASTMutationListener.h"
 #include "clang/AST/EvaluatedExprVisitor.h"
 #include "clang/AST/StmtObjC.h"
@@ -1448,8 +1449,11 @@ void SemaObjC::AddCFAuditedAttribute(Decl *D) {
     return;
 
   // Don't add a redundant or conflicting attribute.
-  if (D->hasAttr<CFAuditedTransferAttr>() ||
-      D->hasAttr<CFUnknownTransferAttr>())
+  const bool Suppressed =
+      isAPINotesInferenceSuppressed(D, attr::CFAuditedTransfer);
+  recordCapturedAPINotesInference(SemaRef, D, attr::CFAuditedTransfer,
+                                  /*Inferred=*/!Suppressed);
+  if (Suppressed)
     return;
 
   AttributeCommonInfo Info(IdLoc.getIdentifierInfo(),

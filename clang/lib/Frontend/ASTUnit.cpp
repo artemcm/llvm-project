@@ -690,7 +690,8 @@ std::unique_ptr<ASTUnit> ASTUnit::LoadFromASTFile(
     const FileSystemOptions &FileSystemOpts, const HeaderSearchOptions &HSOpts,
     const LangOptions *ProvidedLangOpts, bool OnlyLocalDecls,
     CaptureDiagsKind CaptureDiagnostics, bool AllowASTWithCompilerErrors,
-    bool UserFilesAreVolatile) {
+    bool UserFilesAreVolatile,
+    std::optional<llvm::VersionTuple> APINotesSwiftVersion) {
   std::unique_ptr<ASTUnit> AST(new ASTUnit(true));
 
   // Recover resources if we crash before exiting this method.
@@ -781,6 +782,7 @@ std::unique_ptr<ASTUnit> ASTUnit::LoadFromASTFile(
       /*AllowConfigurationMismatch=*/false,
       /*ValidateSystemInputs=*/false,
       /*ForceValidateUserInputs=*/true, HSOpts.ValidateASTInputFilesContent);
+  AST->Reader->setAPINotesSwiftVersion(APINotesSwiftVersion);
 
   // Attach the AST reader to the AST context as an external AST source, so that
   // declarations will be deserialized from the AST file as needed.

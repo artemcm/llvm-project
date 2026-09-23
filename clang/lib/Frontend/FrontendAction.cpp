@@ -967,7 +967,9 @@ bool FrontendAction::BeginSourceFile(CompilerInstance &CI,
     std::unique_ptr<ASTUnit> AST = ASTUnit::LoadFromASTFile(
         InputFile, CI.getPCHContainerReader(), ASTUnit::LoadEverything,
         CI.getVirtualFileSystemPtr(), nullptr, Diags, CI.getFileSystemOpts(),
-        CI.getHeaderSearchOpts(), &CI.getLangOpts());
+        CI.getHeaderSearchOpts(), &CI.getLangOpts(), /*OnlyLocalDecls=*/false,
+        CaptureDiagsKind::None, /*AllowASTWithCompilerErrors=*/false,
+        /*UserFilesAreVolatile=*/false, CI.getAPINotesCollapseVersion());
 
     if (!AST)
       return false;

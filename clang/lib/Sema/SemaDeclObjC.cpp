@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SemaAPINotesInternal.h"
 #include "TypeLocBuilder.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -264,24 +265,23 @@ bool SemaObjC::CheckARCMethodDecl(ObjCMethodDecl *method) {
 
     method->addAttr(NSConsumesSelfAttr::CreateImplicit(Context));
 
-    // Don't add a second copy of this attribute, but otherwise don't
-    // let it be suppressed.
-    if (method->hasAttr<NSReturnsRetainedAttr>())
-      return false;
     break;
 
   case OMF_alloc:
   case OMF_copy:
   case OMF_mutableCopy:
   case OMF_new:
-    if (method->hasAttr<NSReturnsRetainedAttr>() ||
-        method->hasAttr<NSReturnsNotRetainedAttr>() ||
-        method->hasAttr<NSReturnsAutoreleasedAttr>())
-      return false;
     break;
   }
 
-  method->addAttr(NSReturnsRetainedAttr::CreateImplicit(Context));
+  // Don't add a second copy of this attribute. An init method's inference is
+  // not otherwise suppressed; the other families yield to any convention.
+  const bool Suppressed =
+      isAPINotesInferenceSuppressed(method, attr::NSReturnsRetained);
+  recordCapturedAPINotesInference(SemaRef, method, attr::NSReturnsRetained,
+                                  /*Inferred=*/!Suppressed);
+  if (!Suppressed)
+    method->addAttr(NSReturnsRetainedAttr::CreateImplicit(Context));
   return false;
 }
 

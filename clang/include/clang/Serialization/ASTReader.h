@@ -1619,6 +1619,15 @@ private:
   RecordLocation TypeCursorForIndex(serialization::TypeID ID);
   void LoadedDecl(unsigned Index, Decl *D);
   Decl *ReadDeclRecord(GlobalDeclID ID);
+  /// Whether any declaration read so far carries a captured API notes slice.
+  /// Until one does, there is nothing to collapse.
+  bool ReadVersionedAPINotesSlice = false;
+  /// The Swift version to collapse captured API notes slices at, or
+  /// std::nullopt to leave them captured. See setAPINotesSwiftVersion.
+  std::optional<VersionTuple> APINotesSwiftVersion = VersionTuple();
+  /// Collapse the API notes slices captured on a just-deserialized declaration,
+  /// at the Swift version this compilation requests.
+  void collapseVersionedAPINotes(Decl *D);
   void markIncompleteDeclChain(Decl *D);
 
   /// Returns the most recent declaration of a declaration (which must be
@@ -1936,6 +1945,20 @@ public:
   /// Get the AST deserialization listener.
   ASTDeserializationListener *getDeserializationListener() {
     return DeserializationListener;
+  }
+
+  /// Set the Swift version at which API notes captured by
+  /// -fswift-version-independent-apinotes are applied to each declaration as
+  /// it is read. Pass std::nullopt for a compilation that captures API notes
+  /// itself: it must pass the slices it reads on to its own importers
+  /// unapplied. Until this is called, slices are applied as for a compilation
+  /// that requests no Swift version.
+  ///
+  /// This is the reader's own setting rather than a language option because
+  /// reading an AST file as the main file replaces the language options with
+  /// the file's, and the file says nothing about who is reading it.
+  void setAPINotesSwiftVersion(std::optional<VersionTuple> Version) {
+    APINotesSwiftVersion = Version;
   }
 
   /// Determine whether this AST reader has a global index.

@@ -854,6 +854,25 @@ enum AttrName { Target, TargetClones, TargetVersion };
 
 void inferNoReturnAttr(Sema &S, Decl *D);
 
+/// What Sema::CollapseVersionedAPINotes replaced on the declarations it
+/// collapsed, their attribute lists, so it can be put back.
+class APINotesCollapseUndo {
+public:
+  /// Record \p D's current state. Recording it twice is harmless: restore
+  /// puts back the oldest state.
+  void save(Decl *D);
+
+  /// Put every recorded declaration back as it was, most recent first.
+  void restore();
+
+private:
+  struct Saved {
+    Decl *D;
+    std::optional<AttrVec> Attrs;
+  };
+  SmallVector<Saved, 2> Decls;
+};
+
 #ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
@@ -1656,6 +1675,31 @@ public:
   ///
   /// Triggered by declaration-attribute processing.
   void ProcessAPINotes(Decl *D);
+
+  /// Apply the API notes slices captured under
+  /// -fswift-version-independent-apinotes to a declaration deserialized from a
+  /// module that was built with it, and to its parameters, as a client at
+  /// Swift version \p Requested sees them.
+  ///
+  /// Such a module carries every slice unapplied, so that one module can serve
+  /// clients at any Swift language mode. This selects the slices that apply at
+  /// \p Requested and applies them, reproducing the attribute set
+  /// ProcessAPINotes would have produced. A declaration that carries no
+  /// captured slices is left alone.
+  ///
+  /// Static, because it needs no Sema: ASTReader calls it as it reads a
+  /// declaration, which can be before Sema exists. Whether to collapse is the
+  /// caller's decision; ASTReader does not when its compilation captures too.
+  ///
+  /// A parameter collapses with its function, so this does nothing to one
+  /// directly.
+  ///
+  /// \param Undo If given, records what the collapse replaces, so that a
+  /// producer that collapses to see a declaration as an importer would can
+  /// put it back.
+  static void CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
+                                        VersionTuple Requested,
+                                        APINotesCollapseUndo *Undo = nullptr);
   /// Apply the 'Nullability:' annotation to the specified declaration
   void ApplyNullability(Decl *D, NullabilityKind Nullability);
   /// Apply the 'Type:' annotation to the specified declaration

@@ -3404,6 +3404,27 @@ def SwiftVersionedSlice : Attr {
   let Documentation = [InternalOnly];
 }
 
+def SwiftVersionedInference : Attr {
+  // This attribute has no spellings as it is only ever created implicitly,
+  // and only under -fswift-version-independent-apinotes.
+  //
+  // Sema infers some attributes after API notes apply, unless an attribute
+  // that API notes can add or remove is present: an ARC method family's
+  // ns_returns_retained, and cf_audited_transfer inside an audited region.
+  // Capture mode applies no API notes, so it records here that the
+  // inference's other preconditions held and whether it inferred regardless.
+  // The collapse evaluates the guard again once it has applied the slices.
+  let Spellings = [];
+  let Args = [UnsignedArgument<"RawKind">, BoolArgument<"Inferred">];
+  let SemaHandler = 0;
+  let Documentation = [InternalOnly];
+  let AdditionalMembers = [{
+    attr::Kind getInferredKind() const {
+      return static_cast<attr::Kind>(getRawKind());
+    }
+  }];
+}
+
 def NoDeref : TypeAttr {
   let Spellings = [Clang<"noderef">];
   let Documentation = [NoDerefDocs];

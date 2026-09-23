@@ -10,6 +10,7 @@
 #define LLVM_CLANG_LIB_SEMA_SEMAAPINOTESINTERNAL_H
 
 #include "clang/APINotes/Types.h"
+#include "clang/Basic/AttrKinds.h"
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -20,6 +21,7 @@
 #include <utility>
 
 namespace clang {
+class Decl;
 class Sema;
 struct APINotesParameterSelectorCandidates;
 namespace api_notes {
@@ -92,6 +94,21 @@ struct APINotesSelectorDiagnosticState {
 
   void diagnoseUnused(Sema &S) const;
 };
+
+/// Whether \p D's attributes suppress an inference Sema makes after API notes
+/// apply, of an attribute of kind \p Kind: ns_returns_retained for a method of
+/// an ARC method family, or cf_audited_transfer inside an audited region. Sema
+/// asks before it infers, and the collapse of captured API notes asks again
+/// once it has applied the slices.
+bool isAPINotesInferenceSuppressed(const Decl *D, attr::Kind Kind);
+
+/// Record, under -fswift-version-independent-apinotes, that Sema has reached
+/// an inference of an attribute of kind \p Kind on \p D that API notes could
+/// suppress, and whether it \p Inferred given the attributes live now. The
+/// collapse decides again once it has applied the slices. Call it just before
+/// adding the inferred attribute.
+void recordCapturedAPINotesInference(Sema &S, Decl *D, attr::Kind Kind,
+                                     bool Inferred);
 
 } // namespace clang
 

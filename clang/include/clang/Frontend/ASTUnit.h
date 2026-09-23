@@ -721,6 +721,9 @@ public:
   /// \param Diags - The diagnostics engine to use for reporting errors; its
   /// lifetime is expected to extend past that of the returned ASTUnit.
   ///
+  /// \param APINotesSwiftVersion - The Swift version to apply captured API
+  /// notes at; see ASTReader::setAPINotesSwiftVersion.
+  ///
   /// \returns - The initialized ASTUnit or null if the AST failed to load.
   static std::unique_ptr<ASTUnit> LoadFromASTFile(
       StringRef Filename, const PCHContainerReader &PCHContainerRdr,
@@ -732,7 +735,9 @@ public:
       bool OnlyLocalDecls = false,
       CaptureDiagsKind CaptureDiagnostics = CaptureDiagsKind::None,
       bool AllowASTWithCompilerErrors = false,
-      bool UserFilesAreVolatile = false);
+      bool UserFilesAreVolatile = false,
+      std::optional<llvm::VersionTuple> APINotesSwiftVersion =
+          llvm::VersionTuple());
 
 private:
   /// Helper function for \c LoadFromCompilerInvocation() and

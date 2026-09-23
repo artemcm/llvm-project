@@ -67,6 +67,41 @@ static unsigned parameterSelectorSliceGroup(unsigned ReaderIndex) {
   return 2 * ReaderIndex + 1;
 }
 
+namespace {
+/// What an API notes addition or removal wrapper records: the group and
+/// version of its slice, and the attribute it adds or the kind it removes.
+struct CapturedSlice {
+  unsigned Group;
+  VersionTuple Version;
+  attr::Kind Kind;
+  /// The attribute an addition adds; null for a removal.
+  Attr *Payload;
+};
+} // namespace
+
+/// What \p A records, if it is an API notes addition or removal wrapper.
+static std::optional<CapturedSlice> getCapturedSlice(const Attr *A) {
+  if (const auto *Addition = dyn_cast<SwiftVersionedAdditionAttr>(A)) {
+    Attr *Payload = Addition->getAdditionalAttr();
+    return CapturedSlice{Addition->getSliceGroup(), Addition->getVersion(),
+                         Payload->getKind(), Payload};
+  }
+  if (const auto *Removal = dyn_cast<SwiftVersionedRemovalAttr>(A))
+    return CapturedSlice{Removal->getSliceGroup(), Removal->getVersion(),
+                         Removal->getAttrKindToRemove(), nullptr};
+  return std::nullopt;
+}
+
+/// The slice group an API notes wrapper or slice marker belongs to, if \p A is
+/// one.
+static std::optional<unsigned> apiNotesSliceGroup(const Attr *A) {
+  if (std::optional<CapturedSlice> Slice = getCapturedSlice(A))
+    return Slice->Group;
+  if (const auto *Marker = dyn_cast<SwiftVersionedSliceAttr>(A))
+    return Marker->getSliceGroup();
+  return std::nullopt;
+}
+
 /// Determine whether this is a multi-level pointer type.
 static bool isIndirectPointerType(QualType Type) {
   QualType Pointee = Type->getPointeeType();
@@ -383,19 +418,24 @@ static void ProcessAPINotes(Sema &S, Decl *D,
 
   // swift_name
   if (!Info.SwiftName.empty()) {
+    AttributeFactory AF{};
+    AttributePool AP{AF};
+    auto &C = S.getASTContext();
+    ParsedAttr *SNA = AP.create(&C.Idents.get("swift_name"), SourceRange(),
+                                AttributeScopeInfo(), nullptr, nullptr, nullptr,
+                                ParsedAttr::Form::GNU());
+    const bool IsValid = S.Swift().DiagnoseName(
+        D, Info.SwiftName, D->getLocation(), *SNA, /*IsAsync=*/false);
+
+    // A rejected name adds nothing, but its slice still displaces the
+    // declaration's own Swift name when selected. Capture has no attribute to
+    // wrap for it, so it records a removal instead, which the collapse
+    // replays as exactly that.
     handleAPINotedAttribute<SwiftNameAttr>(
-        S, D, true, Metadata, [&]() -> SwiftNameAttr * {
-          AttributeFactory AF{};
-          AttributePool AP{AF};
-          auto &C = S.getASTContext();
-          ParsedAttr *SNA = AP.create(
-              &C.Idents.get("swift_name"), SourceRange(), AttributeScopeInfo(),
-              nullptr, nullptr, nullptr, ParsedAttr::Form::GNU());
-
-          if (!S.Swift().DiagnoseName(D, Info.SwiftName, D->getLocation(), *SNA,
-                                      /*IsAsync=*/false))
+        S, D, IsValid || !S.captureSwiftVersionIndependentAPINotes(), Metadata,
+        [&]() -> SwiftNameAttr * {
+          if (!IsValid)
             return nullptr;
-
           return new (S.Context)
               SwiftNameAttr(S.Context, getPlaceholderAttrInfo(),
                             ASTAllocateString(S.Context, Info.SwiftName));
@@ -925,41 +965,68 @@ static void ProcessAPINotes(Sema &S, ObjCInterfaceDecl *D,
 /// This must be run \em before processing API notes for \p D, because otherwise
 /// any existing SwiftName attribute will have been packaged up in a
 /// SwiftVersionedAdditionAttr.
+///
+/// \param Selected The selected slice's version: empty if the unversioned
+/// slice is selected, or if none is.
+/// \param SetsSwiftNameAt Whether the slice of \p SliceGroup at a given
+/// version sets a Swift name.
+static void maybeAttachUnversionedSwiftName(
+    ASTContext &Ctx, Decl *D, VersionTuple Selected, unsigned SliceGroup,
+    llvm::function_ref<bool(VersionTuple)> SetsSwiftNameAt) {
+  // Is the active slice versioned, and does it set a Swift name that neither
+  // the declaration nor the unversioned slice has?
+  if (Selected.empty() || D->hasAttr<SwiftNameAttr>() ||
+      !SetsSwiftNameAt(Selected) || SetsSwiftNameAt(VersionTuple()))
+    return;
+
+  // Then explicitly call that out with a removal, replaced by the selected
+  // slice's name.
+  D->addAttr(SwiftVersionedRemovalAttr::CreateImplicit(
+      Ctx, Selected, attr::SwiftName, /*IsReplacedByActive=*/true, SliceGroup));
+}
+
 template <typename SpecificInfo>
 static void maybeAttachUnversionedSwiftName(
     Sema &S, Decl *D,
-    const api_notes::APINotesReader::VersionedInfo<SpecificInfo> Info,
+    const api_notes::APINotesReader::VersionedInfo<SpecificInfo> &Info,
     unsigned SliceGroup) {
-  if (D->hasAttr<SwiftNameAttr>())
-    return;
   if (!Info.getSelected())
     return;
-
-  // Is the active slice versioned, and does it set a Swift name?
-  VersionTuple SelectedVersion;
-  SpecificInfo SelectedInfoSlice;
-  std::tie(SelectedVersion, SelectedInfoSlice) = Info[*Info.getSelected()];
-  if (SelectedVersion.empty())
-    return;
-  if (SelectedInfoSlice.SwiftName.empty())
-    return;
-
-  // Does the unversioned slice /not/ set a Swift name?
-  for (const auto &VersionAndInfoSlice : Info) {
-    if (!VersionAndInfoSlice.first.empty())
-      continue;
-    if (!VersionAndInfoSlice.second.SwiftName.empty())
-      return;
-  }
-
-  // Then explicitly call that out with a removal attribute.
-  VersionedInfoMetadata DummyFutureMetadata(SelectedVersion, SliceGroup,
-                                            IsActive_t::Inactive,
-                                            IsSubstitution_t::Replacement);
-  handleAPINotedAttribute<SwiftNameAttr>(
-      S, D, /*add*/ false, DummyFutureMetadata, []() -> SwiftNameAttr * {
-        llvm_unreachable("should not try to add an attribute here");
+  maybeAttachUnversionedSwiftName(
+      S.Context, D, Info[*Info.getSelected()].first, SliceGroup,
+      [&](VersionTuple Version) {
+        return llvm::any_of(Info, [&](const auto &VersionAndInfoSlice) {
+          return VersionAndInfoSlice.first == Version &&
+                 !VersionAndInfoSlice.second.SwiftName.empty();
+        });
       });
+}
+
+/// The parameters that take API notes from \p D's entry, if any.
+static ArrayRef<ParmVarDecl *> getAPINotedParams(Decl *D) {
+  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+    return FD->parameters();
+  if (const auto *MD = dyn_cast<ObjCMethodDecl>(D))
+    return MD->parameters();
+  return {};
+}
+
+/// Drop \p D's markers for \p Group if no slice of that group left anything
+/// else on it. A parameter is marked for every slice of its function's lookup,
+/// in case that slice annotates it, and most slices do not.
+static void dropUnusedSliceMarkers(Decl *D, unsigned Group) {
+  if (!D->hasAttrs())
+    return;
+  AttrVec &Attrs = D->getAttrs();
+  if (llvm::any_of(Attrs, [&](const Attr *A) {
+        return !isa<SwiftVersionedSliceAttr>(A) &&
+               apiNotesSliceGroup(A) == Group;
+      }))
+    return;
+  llvm::erase_if(Attrs,
+                 [&](const Attr *A) { return apiNotesSliceGroup(A) == Group; });
+  if (Attrs.empty())
+    D->dropAttrs();
 }
 
 /// Processes all versions of versioned API notes.
@@ -997,8 +1064,15 @@ static void ProcessVersionedAPINotes(
       // versions it covers, and winning suppresses every other slice, so a
       // client recomputing the selection cannot infer the slice set from the
       // addition and removal wrappers alone.
+      //
+      // A parameter's notes come from this same lookup and take its
+      // selection, so each parameter is marked too. It collapses with its
+      // function, but selects from its own markers.
       D->addAttr(SwiftVersionedSliceAttr::CreateImplicit(S.Context, Version,
                                                          SliceGroup));
+      for (ParmVarDecl *Param : getAPINotedParams(D))
+        Param->addAttr(SwiftVersionedSliceAttr::CreateImplicit(
+            S.Context, Version, SliceGroup));
     } else if (Active == IsActive_t::Inactive && Version.empty()) {
       Replacement = IsSubstitution_t::Replacement;
       Version = Info[Selected].first;
@@ -1008,6 +1082,10 @@ static void ProcessVersionedAPINotes(
         S, D, InfoSlice,
         VersionedInfoMetadata(Version, SliceGroup, Active, Replacement));
   }
+
+  if (S.captureSwiftVersionIndependentAPINotes())
+    for (ParmVarDecl *Param : getAPINotedParams(D))
+      dropUnusedSliceMarkers(Param, SliceGroup);
 }
 
 static std::optional<api_notes::Context>
@@ -1581,4 +1659,229 @@ void Sema::DiagnoseUnusedAPINotesSelectors() {
   if (!Diags.isIgnored(diag::warn_apinotes_message, SourceLocation()))
     APINotesSelectorDiagnostics->diagnoseUnused(*this);
   APINotesSelectorDiagnostics.reset();
+}
+
+//===----------------------------------------------------------------------===//
+// Consumer-side collapse
+//
+// A module built with -fswift-version-independent-apinotes carries every API
+// notes slice unapplied, wrapped. A consumer of that module has one Swift
+// version, so on reading a declaration it runs the selection the default mode
+// would have run and applies the winner, reproducing the default mode's
+// attribute list exactly, order included. See ProcessVersionedAPINotes above
+// for the shape being reproduced.
+//===----------------------------------------------------------------------===//
+
+/// The winning slice version of each slice group that has a winner, empty for
+/// an unversioned winner.
+using SelectedSlices = llvm::SmallDenseMap<unsigned, VersionTuple, 8>;
+
+/// Selection, once per slice group, as APINotesReader::VersionedInfo's
+/// constructor makes it: the lowest slice at or above \p Requested, else the
+/// unversioned slice. The match is gated on a non-empty requested version
+/// there, so with none requested only an unversioned slice can win.
+static SelectedSlices selectCapturedSlices(const Decl *D,
+                                           VersionTuple Requested) {
+  SelectedSlices Selected;
+  for (const auto *Marker : D->specific_attrs<SwiftVersionedSliceAttr>()) {
+    const VersionTuple Version = Marker->getVersion();
+    const bool Matches = !Requested.empty() && Version >= Requested;
+    if (!Matches && !Version.empty())
+      continue;
+    auto [It, Inserted] =
+        Selected.try_emplace(Marker->getSliceGroup(), Version);
+    // A match beats the unversioned slice, and a lower match a higher one.
+    if (!Inserted && Matches && (It->second.empty() || Version < It->second))
+      It->second = Version;
+  }
+  return Selected;
+}
+
+/// Whether \p A is a captured Swift name from the slice of \p Group at
+/// \p Version: an addition of one, or, for a name the producer rejected, a
+/// removal. The default mode tests only that the slice names something.
+static bool isCapturedSwiftName(const Attr *A, unsigned Group,
+                                VersionTuple Version) {
+  std::optional<CapturedSlice> Slice = getCapturedSlice(A);
+  return Slice && Slice->Group == Group && Slice->Version == Version &&
+         Slice->Kind == attr::SwiftName;
+}
+
+bool clang::isAPINotesInferenceSuppressed(const Decl *D, attr::Kind Kind) {
+  switch (Kind) {
+  case attr::NSReturnsRetained:
+    // An init method only avoids a second copy.
+    if (cast<ObjCMethodDecl>(D)->getMethodFamily() == OMF_init)
+      return D->hasAttr<NSReturnsRetainedAttr>();
+    return D->hasAttr<NSReturnsRetainedAttr>() ||
+           D->hasAttr<NSReturnsNotRetainedAttr>() ||
+           D->hasAttr<NSReturnsAutoreleasedAttr>();
+  case attr::CFAuditedTransfer:
+    return D->hasAttr<CFAuditedTransferAttr>() ||
+           D->hasAttr<CFUnknownTransferAttr>();
+  default:
+    llvm_unreachable("Sema infers no other attribute after API notes");
+  }
+}
+
+static Attr *createInferredAttr(ASTContext &Ctx, attr::Kind Kind) {
+  if (Kind == attr::NSReturnsRetained)
+    return NSReturnsRetainedAttr::CreateImplicit(Ctx);
+  return CFAuditedTransferAttr::CreateImplicit(Ctx);
+}
+
+/// Rebuild \p D's attribute list from the slices captured on it, as the
+/// default mode would have left it: a source attribute stays in place, a
+/// winning slice is applied, and a losing slice stays wrapped. An attribute
+/// Sema infers after API notes apply is inferred again.
+///
+/// The list is rebuilt in one walk, in stored order. That is the order the
+/// default mode applies slices in, ascending group and then emission order,
+/// and the default mode interleaves real attributes and wrappers as it goes,
+/// so walking the same way reproduces its attribute order. Rebuilding rather
+/// than editing also leaves the captured attributes untouched, so a producer
+/// that collapses to precompute something for its importers can put them back
+/// afterwards.
+static void replayCapturedSlices(ASTContext &Context, Decl *D,
+                                 const SelectedSlices &Selected) {
+  AttrVec &Rebuilt = D->getAttrs();
+  AttrVec Captured;
+  std::swap(Captured, Rebuilt);
+
+  std::optional<unsigned> CurrentGroup;
+  bool DropInferred = false;
+  for (Attr *A : Captured) {
+    // The producer's own inference, which the record before it overruled.
+    if (std::exchange(DropInferred, false)) {
+      assert(A->isImplicit() && "expected the producer's inferred attribute");
+      continue;
+    }
+
+    // Where Sema inferred an attribute after API notes applied, or declined
+    // to, decide again now that they have.
+    if (const auto *Inference = dyn_cast<SwiftVersionedInferenceAttr>(A)) {
+      const attr::Kind Kind = Inference->getInferredKind();
+      const bool Suppressed = isAPINotesInferenceSuppressed(D, Kind);
+      if (!Inference->getInferred() && !Suppressed)
+        Rebuilt.push_back(createInferredAttr(Context, Kind));
+      DropInferred = Inference->getInferred() && Suppressed;
+      continue;
+    }
+
+    // A marker leads its slice, so a group's first marker is where the default
+    // mode runs maybeAttachUnversionedSwiftName, before the group's slices. It
+    // does not for a parameter.
+    // Markers themselves have done their job, and the default mode has none.
+    if (const auto *Marker = dyn_cast<SwiftVersionedSliceAttr>(A)) {
+      const unsigned Group = Marker->getSliceGroup();
+      if (CurrentGroup != Group && !isa<ParmVarDecl>(D)) {
+        CurrentGroup = Group;
+        maybeAttachUnversionedSwiftName(
+            Context, D, Selected.lookup(Group), Group,
+            [&](VersionTuple Version) {
+              return llvm::any_of(Captured, [&](const Attr *Other) {
+                return isCapturedSwiftName(Other, Group, Version);
+              });
+            });
+      }
+      continue;
+    }
+
+    std::optional<CapturedSlice> Slice = getCapturedSlice(A);
+    if (!Slice) {
+      Rebuilt.push_back(A);
+      continue;
+    }
+    const unsigned Group = Slice->Group;
+    const VersionTuple Version = Slice->Version;
+    Attr *Payload = Slice->Payload;
+    const attr::Kind Kind = Slice->Kind;
+
+    auto Winner = Selected.find(Group);
+    const bool IsWinner = Winner != Selected.end() && Version == Winner->second;
+
+    // ProcessAPINotes skips an UnsafeBufferUsage slice, winner or not, once
+    // the attribute is live, as it is when a slice applied before won.
+    if (isa_and_nonnull<UnsafeBufferUsageAttr>(Payload) &&
+        D->hasAttr<UnsafeBufferUsageAttr>())
+      continue;
+
+    // A rejected Swift name leaves nothing behind unless it is selected.
+    if (!IsWinner && !Payload && Kind == attr::SwiftName)
+      continue;
+
+    // A losing versioned slice, or any slice of a group with no winner, stays
+    // exactly as captured: the default mode wraps it the same way.
+    if (Winner == Selected.end() ||
+        (!Version.empty() && Version != Winner->second)) {
+      Rebuilt.push_back(A);
+      continue;
+    }
+
+    // Otherwise this is either the winner, applied as the active slice, or the
+    // losing unversioned slice. The default mode records that as replaced, at
+    // the winner's version, which is what a compatibility alias is obsoleted
+    // at.
+    const VersionedInfoMetadata Metadata(
+        Winner->second, Group,
+        IsWinner ? IsActive_t::Active : IsActive_t::Inactive,
+        IsWinner ? IsSubstitution_t::Original : IsSubstitution_t::Replacement);
+    handleAPINotedAttributeImpl(Context, D, /*IsAddition=*/Payload != nullptr,
+                                Metadata, Kind,
+                                [&] { return Payload->clone(Context); });
+  }
+
+  if (Rebuilt.empty())
+    D->dropAttrs();
+}
+
+void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
+                                     VersionTuple Requested,
+                                     APINotesCollapseUndo *Undo) {
+  // A parameter collapses with its function.
+  if (!D || isa<ParmVarDecl>(D))
+    return;
+
+  // Only a capture-mode declaration carries slice markers. The default mode
+  // also leaves addition wrappers behind, for the slices that lost, and
+  // re-selecting over those would corrupt an already-applied declaration.
+  auto Replay = [&](Decl *D) {
+    if (!D->hasAttr<SwiftVersionedSliceAttr>())
+      return;
+    if (Undo)
+      Undo->save(D);
+    replayCapturedSlices(Context, D, selectCapturedSlices(D, Requested));
+  };
+  Replay(D);
+  for (ParmVarDecl *Param : getAPINotedParams(D))
+    Replay(Param);
+}
+
+void APINotesCollapseUndo::save(Decl *D) {
+  Saved S{};
+  S.D = D;
+  if (D->hasAttrs())
+    S.Attrs = D->getAttrs();
+  Decls.push_back(std::move(S));
+}
+
+void APINotesCollapseUndo::restore() {
+  for (Saved &S : llvm::reverse(Decls)) {
+    Decl *D = S.D;
+    if (!S.Attrs)
+      D->dropAttrs();
+    else if (D->hasAttrs())
+      D->getAttrs() = std::move(*S.Attrs);
+    else
+      D->setAttrs(*S.Attrs);
+  }
+  Decls.clear();
+}
+
+void clang::recordCapturedAPINotesInference(Sema &S, Decl *D, attr::Kind Kind,
+                                            bool Inferred) {
+  if (S.captureSwiftVersionIndependentAPINotes() &&
+      D->hasAttr<SwiftVersionedSliceAttr>())
+    D->addAttr(
+        SwiftVersionedInferenceAttr::CreateImplicit(S.Context, Kind, Inferred));
 }
