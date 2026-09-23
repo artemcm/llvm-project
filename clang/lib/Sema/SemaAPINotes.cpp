@@ -1707,6 +1707,51 @@ static bool isCapturedSwiftName(const Attr *A, unsigned Group,
          Slice->Kind == attr::SwiftName;
 }
 
+/// Whether Sema infers attributes of kind \p Kind only once API notes have
+/// applied: ns_returns_retained for a method of an ARC method family, and
+/// cf_audited_transfer inside an audited region.
+static bool isAPINotesInferredKind(attr::Kind Kind) {
+  return Kind == attr::NSReturnsRetained || Kind == attr::CFAuditedTransfer;
+}
+
+/// Whether \p Attrs suppress Sema's inference of an attribute of kind \p Kind,
+/// for a declaration that is an init method if \p IsInit.
+template <typename RangeT>
+static bool suppressesInference(RangeT &&Attrs, attr::Kind Kind, bool IsInit) {
+  auto Has = [&](std::initializer_list<attr::Kind> Kinds) {
+    return llvm::any_of(Attrs, [&](const Attr *A) {
+      return llvm::is_contained(Kinds, A->getKind());
+    });
+  };
+  assert(isAPINotesInferredKind(Kind) && "not inferred after API notes");
+  if (Kind == attr::CFAuditedTransfer)
+    return Has({attr::CFAuditedTransfer, attr::CFUnknownTransfer});
+  // An init method only avoids a second copy.
+  if (IsInit)
+    return Has({attr::NSReturnsRetained});
+  return Has({attr::NSReturnsRetained, attr::NSReturnsNotRetained,
+              attr::NSReturnsAutoreleased});
+}
+
+static bool isInitMethod(const Decl *D) {
+  const auto *Method = dyn_cast<ObjCMethodDecl>(D);
+  return Method && Method->getMethodFamily() == OMF_init;
+}
+
+/// Whether \p D's attributes suppress an inference Sema makes after API notes
+/// apply, of an attribute of kind \p Kind. Sema asks before it infers, and the
+/// collapse of captured API notes asks again once it has applied the slices.
+static bool isAPINotesInferenceSuppressed(const Decl *D, attr::Kind Kind) {
+  return suppressesInference(D->attrs(), Kind, isInitMethod(D));
+}
+
+static Attr *createInferredAttr(ASTContext &Ctx, attr::Kind Kind) {
+  assert(isAPINotesInferredKind(Kind) && "not inferred after API notes");
+  if (Kind == attr::NSReturnsRetained)
+    return NSReturnsRetainedAttr::CreateImplicit(Ctx);
+  return CFAuditedTransferAttr::CreateImplicit(Ctx);
+}
+
 /// How replayCapturedSlices treats a declaration.
 struct ReplayOptions {
   /// Whether the captured attributes have to stay intact, for an undo to put
@@ -1716,7 +1761,8 @@ struct ReplayOptions {
 
 /// Rebuild \p D's attribute list from the slices captured on it, as the
 /// default mode would have left it: a source attribute stays in place, a
-/// winning slice is applied, and a losing slice stays wrapped.
+/// winning slice is applied, and a losing slice stays wrapped. An attribute
+/// Sema infers after API notes apply is inferred again.
 ///
 /// The list is rebuilt in one walk, in stored order. That is the order the
 /// default mode applies slices in, ascending group and then emission order,
@@ -1737,7 +1783,25 @@ static void replayCapturedSlices(ASTContext &Context, Decl *D,
   std::swap(Captured, Rebuilt);
 
   std::optional<unsigned> CurrentGroup;
+  bool DropInferred = false;
   for (Attr *A : Captured) {
+    // The producer's own inference, which the record before it overruled.
+    if (std::exchange(DropInferred, false)) {
+      assert(A->isImplicit() && "expected the producer's inferred attribute");
+      continue;
+    }
+
+    // Where Sema inferred an attribute after API notes applied, or declined
+    // to, decide again now that they have.
+    if (const auto *Inference = dyn_cast<SwiftVersionedInferenceAttr>(A)) {
+      const attr::Kind Kind = Inference->getInferredKind();
+      const bool Suppressed = isAPINotesInferenceSuppressed(D, Kind);
+      if (!Inference->getInferred() && !Suppressed)
+        Rebuilt.push_back(createInferredAttr(Context, Kind));
+      DropInferred = Inference->getInferred() && Suppressed;
+      continue;
+    }
+
     // A marker leads its slice, so a group's first marker is where the default
     // mode runs maybeAttachUnversionedSwiftName, before the group's slices. It
     // does not for a parameter.
@@ -1851,4 +1915,13 @@ void APINotesCollapseUndo::restore() {
       D->setAttrs(*S.Attrs);
   }
   Decls.clear();
+}
+
+bool clang::inferAfterAPINotes(Sema &S, Decl *D, attr::Kind Kind) {
+  const bool Inferred = !isAPINotesInferenceSuppressed(D, Kind);
+  if (S.captureSwiftVersionIndependentAPINotes() &&
+      D->hasAttr<SwiftVersionedSliceAttr>())
+    D->addAttr(
+        SwiftVersionedInferenceAttr::CreateImplicit(S.Context, Kind, Inferred));
+  return Inferred;
 }
