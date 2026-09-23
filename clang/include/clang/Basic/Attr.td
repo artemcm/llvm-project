@@ -3410,8 +3410,33 @@ def SwiftVersionedSlice : Attr {
   //
   // SliceGroup says which group this slice came from. See the
   // SwiftVersionedAddition comment above.
+  //
+  // Origin says where the group came from: the declaration's own lookup, or
+  // the property whose implicit accessor this is. For the latter only the
+  // group's winner applies, as the copy of the attribute it leaves live there
+  // that the accessor gets.
   let Spellings = [];
-  let Args = [VersionArgument<"Version">, UnsignedArgument<"SliceGroup">];
+  let Args = [VersionArgument<"Version">, UnsignedArgument<"SliceGroup">,
+              EnumArgument<"Origin", "OriginKind", /*is_string=*/false,
+                           ["own", "copied"],
+                           ["FromOwnLookup", "FromProperty"]>];
+  let SemaHandler = 0;
+  let Documentation = [InternalOnly];
+}
+
+def SwiftVersionedPropertyType : Attr {
+  // This attribute has no spellings as it is only ever created implicitly,
+  // and only under -fswift-version-independent-apinotes.
+  //
+  // A property's implicit accessor derives its type from the property's, once
+  // the property's API notes have applied: the getter returns it and the
+  // setter's parameter takes it, and a null_resettable property returns
+  // nonnull and takes nullable in place of unspecified. Capture mode applies
+  // no API notes, so an accessor that receives the property's type slices
+  // records here the property's type and null_resettable as written, for the
+  // collapse to derive the accessor's type again from the winners.
+  let Spellings = [];
+  let Args = [TypeArgument<"PropertyType">, BoolArgument<"NullResettable">];
   let SemaHandler = 0;
   let Documentation = [InternalOnly];
 }

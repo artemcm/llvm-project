@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SemaAPINotesInternal.h"
 #include "clang/AST/ASTMutationListener.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/ExprCXX.h"
@@ -2310,6 +2311,28 @@ void SemaObjC::DiagnoseMissingDesignatedInitOverrides(
   }
 }
 
+QualType clang::getImplicitAccessorType(ASTContext &Context,
+                                        QualType PropertyType,
+                                        bool NullResettable, bool IsGetter) {
+  // The getter returns the declared property type with all qualifiers
+  // removed, and the setter takes it with all qualifiers removed.
+  QualType Type =
+      IsGetter ? PropertyType.getAtomicUnqualifiedType()
+               : PropertyType.getUnqualifiedType().getAtomicUnqualifiedType();
+
+  // If the property is null_resettable, the getter returns nonnull, and the
+  // setter accepts a nullable value.
+  if (NullResettable) {
+    QualType Modified = Type;
+    if (auto Nullability = AttributedType::stripOuterNullability(Modified);
+        Nullability && *Nullability == NullabilityKind::Unspecified)
+      Type = Context.getAttributedType(IsGetter ? NullabilityKind::NonNull
+                                                : NullabilityKind::Nullable,
+                                       Modified, Modified);
+  }
+  return Type;
+}
+
 /// AddPropertyAttrs - Propagates attributes from a property to the
 /// implicitly-declared getter or setter for that property.
 static void AddPropertyAttrs(Sema &S, ObjCMethodDecl *PropertyMethod,
@@ -2321,6 +2344,24 @@ static void AddPropertyAttrs(Sema &S, ObjCMethodDecl *PropertyMethod,
         isa<AvailabilityAttr>(A))
       PropertyMethod->addAttr(A->clone(S.Context));
   }
+
+  // Under -fswift-version-independent-apinotes the property's API notes are
+  // captured rather than applied, so the accessor gets the slices that would
+  // have set those attributes, and applies them when it is collapsed. So too
+  // for the property's type, which the getter returns and the setter takes.
+  auto IsType = [](attr::Kind K) {
+    return K == attr::SwiftType || K == attr::SwiftNullability;
+  };
+  if (PropertyMethod->param_size() == 0) {
+    propagateCapturedAPINotes(S, PropertyMethod, Property, [&](attr::Kind K) {
+      return isAvailabilityAttrKind(K) || IsType(K);
+    });
+    return;
+  }
+  propagateCapturedAPINotes(S, PropertyMethod, Property,
+                            isAvailabilityAttrKind);
+  propagateCapturedAPINotes(S, PropertyMethod->parameters()[0], Property,
+                            IsType);
 }
 
 /// ProcessPropertyDecl - Make sure that any user-defined setter/getter methods
@@ -2424,20 +2465,11 @@ void SemaObjC::ProcessPropertyDecl(ObjCPropertyDecl *property) {
     // for this class.
     SourceLocation Loc = property->getLocation();
 
-    // The getter returns the declared property type with all qualifiers
-    // removed.
-    QualType resultTy = property->getType().getAtomicUnqualifiedType();
-
-    // If the property is null_resettable, the getter returns nonnull.
-    if (property->getPropertyAttributes() &
-        ObjCPropertyAttribute::kind_null_resettable) {
-      QualType modifiedTy = resultTy;
-      if (auto nullability = AttributedType::stripOuterNullability(modifiedTy)) {
-        if (*nullability == NullabilityKind::Unspecified)
-          resultTy = Context.getAttributedType(NullabilityKind::NonNull,
-                                               modifiedTy, modifiedTy);
-      }
-    }
+    QualType resultTy =
+        getImplicitAccessorType(Context, property->getType(),
+                                property->getPropertyAttributes() &
+                                    ObjCPropertyAttribute::kind_null_resettable,
+                                /*IsGetter=*/true);
 
     GetterMethod = ObjCMethodDecl::Create(
         Context, Loc, Loc, property->getGetterName(), resultTy, nullptr, CD,
@@ -2501,21 +2533,11 @@ void SemaObjC::ProcessPropertyDecl(ObjCPropertyDecl *property) {
               ? ObjCImplementationControl::Optional
               : ObjCImplementationControl::Required);
 
-      // Remove all qualifiers from the setter's parameter type.
-      QualType paramTy =
-          property->getType().getUnqualifiedType().getAtomicUnqualifiedType();
-
-      // If the property is null_resettable, the setter accepts a
-      // nullable value.
-      if (property->getPropertyAttributes() &
-          ObjCPropertyAttribute::kind_null_resettable) {
-        QualType modifiedTy = paramTy;
-        if (auto nullability = AttributedType::stripOuterNullability(modifiedTy)){
-          if (*nullability == NullabilityKind::Unspecified)
-            paramTy = Context.getAttributedType(NullabilityKind::Nullable,
-                                                modifiedTy, modifiedTy);
-        }
-      }
+      QualType paramTy = getImplicitAccessorType(
+          Context, property->getType(),
+          property->getPropertyAttributes() &
+              ObjCPropertyAttribute::kind_null_resettable,
+          /*IsGetter=*/false);
 
       // Invent the arguments for the setter. We don't bother making a
       // nice name for the argument.

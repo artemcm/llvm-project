@@ -22,6 +22,7 @@
 #include <utility>
 
 namespace clang {
+class ASTContext;
 class Decl;
 class MultiLevelTemplateArgumentList;
 class ParmVarDecl;
@@ -97,6 +98,29 @@ struct APINotesSelectorDiagnosticState {
 
   void diagnoseUnused(Sema &S) const;
 };
+
+/// Pass the API notes slices captured on \p Property on to \p Accessor, one of
+/// its implicit accessors or the setter's parameter, under
+/// -fswift-version-independent-apinotes, for the annotations AddPropertyAttrs
+/// or accessor synthesis would pass on: those of a kind \p Copies accepts.
+///
+/// \returns Whether anything was added to \p Accessor.
+bool propagateCapturedAPINotes(Sema &S, Decl *Accessor, const Decl *Property,
+                               llvm::function_ref<bool(attr::Kind)> Copies);
+
+/// The type a property's implicit accessor takes from the property: what the
+/// getter returns, or the setter's parameter takes if not \p IsGetter. A
+/// null_resettable property's getter returns nonnull and its setter takes
+/// nullable in place of unspecified.
+QualType getImplicitAccessorType(ASTContext &Context, QualType PropertyType,
+                                 bool NullResettable, bool IsGetter);
+
+/// Whether \p K is one of the availability kinds that inheritance and accessor
+/// synthesis copy together: deprecated, unavailable and availability.
+inline bool isAvailabilityAttrKind(attr::Kind K) {
+  return K == attr::Deprecated || K == attr::Unavailable ||
+         K == attr::Availability;
+}
 
 /// Whether Sema should infer an attribute of kind \p Kind on \p D, now that
 /// API notes have applied: not if D's attributes suppress it. Under

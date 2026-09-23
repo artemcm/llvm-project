@@ -8199,7 +8199,8 @@ TEST_P(ImportAttributes, ImportAligned) {
 }
 
 // A 'Type:' that -fswift-version-independent-apinotes captures carries the
-// types it parsed, which have to move to the destination context with it.
+// types it parsed, and a property's accessor the property's type as written,
+// which have to move to the destination context with them.
 TEST_P(ImportAttributes, ImportSwiftTypeInVersionedAddition) {
   Decl *FromTU =
       getTuDecl("struct Payload; struct Payload *p; void *test;", Lang_C99);
@@ -8214,6 +8215,8 @@ TEST_P(ImportAttributes, ImportSwiftTypeInVersionedAddition) {
       SwiftTypeAttr::CreateImplicit(FromCtx, "struct Payload *", FromTSI,
                                     FromTSI),
       /*IsReplacedByActive=*/false, /*SliceGroup=*/0));
+  FromD->addAttr(SwiftVersionedPropertyTypeAttr::CreateImplicit(
+      FromCtx, FromTSI, /*NullResettable=*/true));
 
   auto *ToD = Import(FromD, Lang_C99);
   ASSERT_TRUE(ToD);
@@ -8223,10 +8226,15 @@ TEST_P(ImportAttributes, ImportSwiftTypeInVersionedAddition) {
   ASSERT_TRUE(ToType);
   EXPECT_EQ(ToType->getTypeString(), "struct Payload *");
 
+  const auto *ToProperty = ToD->getAttr<SwiftVersionedPropertyTypeAttr>();
+  ASSERT_TRUE(ToProperty);
+  EXPECT_TRUE(ToProperty->getNullResettable());
+
   const TranslationUnitDecl *ToTU =
       ToAST->getASTContext().getTranslationUnitDecl();
   for (const TypeSourceInfo *ToTSI :
-       {ToType->getParsedTypeLoc(), ToType->getAdjustedTypeLoc()}) {
+       {ToType->getParsedTypeLoc(), ToType->getAdjustedTypeLoc(),
+        ToProperty->getPropertyTypeLoc()}) {
     ASSERT_TRUE(ToTSI);
     EXPECT_NE(ToTSI, FromTSI);
     const RecordDecl *ToPayload =

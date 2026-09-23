@@ -9878,6 +9878,12 @@ Expected<Attr *> ASTImporter::Import(const Attr *FromAttr) {
                   AI.importArg(From->getAdjustedTypeLoc()).value());
     break;
   }
+  case attr::SwiftVersionedPropertyType: {
+    const auto *From = cast<SwiftVersionedPropertyTypeAttr>(FromAttr);
+    AI.importAttr(From, AI.importArg(From->getPropertyTypeLoc()).value(),
+                  From->getNullResettable());
+    break;
+  }
   default: {
     // The default branch works for attributes that have no arguments to import.
     // FIXME: Handle every attribute type that has arguments of type to import

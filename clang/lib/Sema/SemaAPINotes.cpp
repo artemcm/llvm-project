@@ -93,6 +93,15 @@ static std::optional<unsigned> apiNotesSliceGroup(const Attr *A) {
   return std::nullopt;
 }
 
+/// One above the highest slice group \p D carries, or zero.
+static unsigned nextSliceGroup(const Decl *D) {
+  unsigned Next = 0;
+  for (const auto *A : D->attrs())
+    if (std::optional<unsigned> Group = apiNotesSliceGroup(A))
+      Next = std::max(Next, *Group + 1);
+  return Next;
+}
+
 /// Determine whether this is a multi-level pointer type.
 static bool isIndirectPointerType(QualType Type) {
   QualType Pointee = Type->getPointeeType();
@@ -1138,11 +1147,13 @@ static void ProcessVersionedAPINotes(
       // A parameter's notes come from this same lookup and take its
       // selection, so each parameter is marked too. It collapses with its
       // function, but selects from its own markers.
-      D->addAttr(SwiftVersionedSliceAttr::CreateImplicit(S.Context, Version,
-                                                         SliceGroup));
+      D->addAttr(SwiftVersionedSliceAttr::CreateImplicit(
+          S.Context, Version, SliceGroup,
+          SwiftVersionedSliceAttr::FromOwnLookup));
       for (ParmVarDecl *Param : getAPINotedParams(D))
         Param->addAttr(SwiftVersionedSliceAttr::CreateImplicit(
-            S.Context, Version, SliceGroup));
+            S.Context, Version, SliceGroup,
+            SwiftVersionedSliceAttr::FromOwnLookup));
     } else if (Active == IsActive_t::Inactive && Version.empty()) {
       Replacement = IsSubstitution_t::Replacement;
       Version = Info[Selected].first;
@@ -1374,7 +1385,13 @@ void Sema::ProcessAPINotes(Decl *D) {
   // Each lookup below is its own slice group, numbered in the order the
   // lookups run, which is the order Sema applies them in. A consumer needs that
   // order to resolve two groups whose winners set the same key.
-  unsigned NextSliceGroup = 0;
+  //
+  // Numbering starts one above any group D, or one of its parameters, already
+  // carries: a lookup's markers go on D's parameters too, and an implicit
+  // setter's parameter has groups from the property.
+  unsigned NextSliceGroup = nextSliceGroup(D);
+  for (ParmVarDecl *Param : getAPINotedParams(D))
+    NextSliceGroup = std::max(NextSliceGroup, nextSliceGroup(Param));
 
   auto *DC = D->getDeclContext();
   // Globals.
@@ -1814,6 +1831,24 @@ static bool isAPINotesInferenceApplicable(const Decl *D, attr::Kind Kind) {
   }
 }
 
+/// Apply the winner of a slice group that \p D, a property's implicit accessor,
+/// received from its property, as AddPropertyAttrs copies the attribute that
+/// winner leaves live there.
+///
+/// On the property the slice displaced an attribute, so the default mode
+/// never copies that one, but D received it all the same. The copy goes: the
+/// first attribute the slice displaces.
+///
+/// \param Payload The winner's attribute, or null for a removal.
+/// \param Take What D gets of \p Payload: it, or a copy.
+static void applyReceivedWinner(Decl *D, Attr *Payload, attr::Kind Kind,
+                                llvm::function_ref<Attr *(Attr *)> Take) {
+  if (auto Displaced = findAttrDisplacedBy(D, Kind); Displaced != D->attr_end())
+    D->getAttrs().erase(Displaced);
+  if (Payload)
+    D->addAttr(Take(Payload));
+}
+
 /// Whether \p D's attributes suppress an inference Sema makes after API notes
 /// apply, of an attribute of kind \p Kind. Sema asks before it infers, and the
 /// collapse of captured API notes asks again once it has applied the slices.
@@ -1912,10 +1947,68 @@ static bool applyCapturedType(ASTContext &Ctx, Decl *D, const Attr *Payload) {
   return Changed;
 }
 
+namespace {
+/// The type of the property a property's implicit accessor takes its type
+/// from, as the winners of the type slices it received from the property
+/// rewrite it, and whether they made the property null_resettable.
+struct ReceivedPropertyType {
+  QualType Type;
+  bool NullResettable;
+  /// Whether a winner rewrote anything since the accessor's type was last set.
+  bool Changed = false;
+};
+} // namespace
+
+/// Apply a winning 'Type:' or nullability that a property's implicit accessor
+/// received from its property to \p Property, as ProcessAPINotes applies it
+/// to the property.
+static void applyReceivedPropertyType(ASTContext &Ctx,
+                                      ReceivedPropertyType &Property,
+                                      const Attr *Payload) {
+  if (const auto *Type = dyn_cast<SwiftTypeAttr>(Payload)) {
+    Property.Type = Type->getAdjustedType();
+    Property.Changed = true;
+    return;
+  }
+  // As applyNullabilityToDecl does for a property: a nullability that
+  // changes the type also makes the property null_resettable, if it can be.
+  QualType Modified = Property.Type;
+  Sema::OverrideImplicitNullability(
+      Ctx, Modified, getNullabilityKind(cast<SwiftNullabilityAttr>(Payload)),
+      /*AllowArrayTypes=*/false);
+  if (Modified.getTypePtr() == Property.Type.getTypePtr())
+    return;
+  Property.Type = Modified;
+  if (!isIndirectPointerType(Modified))
+    Property.NullResettable = true;
+  Property.Changed = true;
+}
+
+/// Set the type of \p D, a property's implicit getter or its setter's
+/// parameter, to \p Type.
+///
+/// \returns Whether \p D's type changed.
+static bool setImplicitAccessorType(Decl *D, QualType Type) {
+  if (auto *Method = dyn_cast<ObjCMethodDecl>(D)) {
+    if (Method->getReturnType() == Type)
+      return false;
+    Method->setReturnType(Type);
+    // A method's family depends on its return type.
+    Method->resetMethodFamily();
+    return true;
+  }
+  auto *Param = cast<ParmVarDecl>(D);
+  if (Param->getType() == Type)
+    return false;
+  Param->setType(Type);
+  return true;
+}
+
 /// Rebuild \p D's attribute list from the slices captured on it, as the
 /// default mode would have left it: a source attribute stays in place, a
-/// winning slice is applied, and a losing slice stays wrapped. An attribute
-/// Sema infers after API notes apply is inferred again.
+/// winning slice is applied, and a losing slice stays wrapped. A group
+/// received from another declaration contributes its winner alone. An
+/// attribute Sema infers after API notes apply is inferred again.
 ///
 /// The list is rebuilt in one walk, in stored order. That is the order the
 /// default mode applies slices in, ascending group and then emission order,
@@ -1932,6 +2025,31 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
     return Options.KeepsCaptured ? Payload->clone(Context) : Payload;
   };
 
+  // The groups D received from another declaration, and how.
+  llvm::SmallDenseMap<unsigned, SwiftVersionedSliceAttr::OriginKind, 8>
+      ReceivedGroups;
+  for (const auto *Marker : D->specific_attrs<SwiftVersionedSliceAttr>())
+    if (Marker->getOrigin() != SwiftVersionedSliceAttr::FromOwnLookup)
+      ReceivedGroups[Marker->getSliceGroup()] = Marker->getOrigin();
+
+  // A property's implicit accessor takes its type from the property once the
+  // property's API notes have applied, and before its own do. The winners it
+  // received from the property rewrite the property's type as written, and
+  // the accessor's type is derived from the result before anything else sees
+  // it: the accessor's own type slices, or an inference that depends on it.
+  std::optional<ReceivedPropertyType> Property;
+  if (const auto *Written = D->getAttr<SwiftVersionedPropertyTypeAttr>())
+    Property = ReceivedPropertyType{Written->getPropertyType(),
+                                    Written->getNullResettable()};
+  auto SettleAccessorType = [&] {
+    if (!Property || !std::exchange(Property->Changed, false))
+      return;
+    Result.TypeFollows |= setImplicitAccessorType(
+        D, getImplicitAccessorType(Context, Property->Type,
+                                   Property->NullResettable,
+                                   /*IsGetter=*/isa<ObjCMethodDecl>(D)));
+  };
+
   AttrVec &Rebuilt = D->getAttrs();
   AttrVec Captured;
   std::swap(Captured, Rebuilt);
@@ -1945,9 +2063,14 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
       continue;
     }
 
+    // The property's type as written has done its job by now too.
+    if (isa<SwiftVersionedPropertyTypeAttr>(A))
+      continue;
+
     // Where Sema inferred an attribute after API notes applied, or declined
     // to, decide again now that they have.
     if (const auto *Inference = dyn_cast<SwiftVersionedInferenceAttr>(A)) {
+      SettleAccessorType();
       const attr::Kind Kind = Inference->getInferredKind();
       const bool Wanted = isAPINotesInferenceApplicable(D, Kind) &&
                           !isAPINotesInferenceSuppressed(D, Kind);
@@ -1959,11 +2082,12 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
 
     // A marker leads its slice, so a group's first marker is where the default
     // mode runs maybeAttachUnversionedSwiftName, before the group's slices. It
-    // does not for a parameter.
+    // does not for a parameter, or for a group received from elsewhere.
     // Markers themselves have done their job, and the default mode has none.
     if (const auto *Marker = dyn_cast<SwiftVersionedSliceAttr>(A)) {
       const unsigned Group = Marker->getSliceGroup();
-      if (CurrentGroup != Group && !isa<ParmVarDecl>(D)) {
+      if (CurrentGroup != Group && !isa<ParmVarDecl>(D) &&
+          !ReceivedGroups.contains(Group)) {
         CurrentGroup = Group;
         maybeAttachUnversionedSwiftName(
             Context, D, Selected.lookup(Group), Group,
@@ -1988,13 +2112,31 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
 
     auto Winner = Selected.find(Group);
     const bool IsWinner = Winner != Selected.end() && Version == Winner->second;
+    auto Received = ReceivedGroups.find(Group);
+    const auto Origin = Received == ReceivedGroups.end()
+                            ? SwiftVersionedSliceAttr::FromOwnLookup
+                            : Received->second;
 
     // A type is no attribute. The winner rewrites the declaration's type, and
     // every other slice leaves nothing, as in the default mode.
     if (isa_and_nonnull<SwiftTypeAttr, SwiftNullabilityAttr>(Payload)) {
       if (!IsWinner)
         continue;
+      if (Origin == SwiftVersionedSliceAttr::FromProperty) {
+        assert(Property && "a property's type slice without its type");
+        if (Property)
+          applyReceivedPropertyType(Context, *Property, Payload);
+        continue;
+      }
+      SettleAccessorType();
       Result.TypeFollows |= applyCapturedType(Context, D, Payload);
+      continue;
+    }
+
+    // What a declaration receives is an accessor's, from its property.
+    if (Origin == SwiftVersionedSliceAttr::FromProperty) {
+      if (IsWinner)
+        applyReceivedWinner(D, Payload, Kind, Take);
       continue;
     }
 
@@ -2028,6 +2170,7 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
     handleAPINotedAttributeImpl(Context, D, /*IsAddition=*/Payload != nullptr,
                                 Metadata, Kind, [&] { return Take(Payload); });
   }
+  SettleAccessorType();
 
   if (Rebuilt.empty())
     D->dropAttrs();
@@ -2050,7 +2193,9 @@ void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
 
   // Only a capture-mode declaration carries slice markers. The default mode
   // also leaves addition wrappers behind, for the slices that lost, and
-  // re-selecting over those would corrupt an already-applied declaration.
+  // re-selecting over those would corrupt an already-applied declaration. A
+  // parameter can carry markers its function does not: an implicit setter's
+  // parameter receives its property's type.
   auto Replay = [&](Decl *D) -> ReplayResult {
     if (!D->hasAttr<SwiftVersionedSliceAttr>())
       return ReplayResult();
@@ -2125,6 +2270,93 @@ void APINotesCollapseUndo::restore() {
     }
   }
   Decls.clear();
+}
+
+//===----------------------------------------------------------------------===//
+// A property's accessors
+//
+// Under -fswift-version-independent-apinotes, API notes are not applied to a
+// property, so AddPropertyAttrs would copy its attributes onto its implicit
+// accessors as written. An accessor receives the property's slice groups
+// instead, and the collapse applies each one's winner as the copy it would
+// have got.
+//===----------------------------------------------------------------------===//
+
+/// Copy an API notes wrapper or slice marker onto a property's accessor, under
+/// a new slice group, with a marker that says where the group came from.
+static Attr *cloneReceivedAPINotesAttr(ASTContext &Ctx, const Attr *A,
+                                       unsigned Group) {
+  if (const auto *Addition = dyn_cast<SwiftVersionedAdditionAttr>(A))
+    return SwiftVersionedAdditionAttr::CreateImplicit(
+        Ctx, Addition->getVersion(), Addition->getAdditionalAttr()->clone(Ctx),
+        Addition->getIsReplacedByActive(), Group);
+  if (const auto *Removal = dyn_cast<SwiftVersionedRemovalAttr>(A))
+    return SwiftVersionedRemovalAttr::CreateImplicit(
+        Ctx, Removal->getVersion(), Removal->getRawKind(),
+        Removal->getIsReplacedByActive(), Group);
+  return SwiftVersionedSliceAttr::CreateImplicit(
+      Ctx, cast<SwiftVersionedSliceAttr>(A)->getVersion(), Group,
+      SwiftVersionedSliceAttr::FromProperty);
+}
+
+bool clang::propagateCapturedAPINotes(
+    Sema &S, Decl *Accessor, const Decl *Property,
+    llvm::function_ref<bool(attr::Kind)> Copies) {
+  // The default mode applies the selected slice as a real attribute, which
+  // AddPropertyAttrs copies, and wraps the losing slices only as
+  // per-declaration bookkeeping.
+  if (!S.captureSwiftVersionIndependentAPINotes() || !Property->hasAttrs())
+    return false;
+
+  // Only groups with markers travel: a module built without the flag wraps
+  // the slices that lost, as bookkeeping of its own, which is never copied.
+  llvm::SmallDenseSet<unsigned, 8> MarkedGroups;
+  for (const auto *Marker : Property->specific_attrs<SwiftVersionedSliceAttr>())
+    MarkedGroups.insert(Marker->getSliceGroup());
+
+  // A group travels whole when it wraps an annotation the accessor would get.
+  // A removal counts: the attribute it takes away is still live on the
+  // property, so the accessor got a copy, and the removal has to follow it.
+  llvm::SmallDenseSet<unsigned, 8> Groups;
+  for (const auto *A : Property->attrs())
+    if (std::optional<CapturedSlice> Slice = getCapturedSlice(A);
+        Slice && MarkedGroups.contains(Slice->Group) && Copies(Slice->Kind))
+      Groups.insert(Slice->Group);
+  if (Groups.empty())
+    return false;
+
+  // The property's group numbers are unrelated to the accessor's, so they go
+  // above the accessor's, which keeps group order the order the default mode
+  // applies things in.
+  const unsigned GroupOffset = nextSliceGroup(Accessor);
+  bool CopiesType = false;
+  for (const auto *A : Property->attrs()) {
+    std::optional<unsigned> Group = apiNotesSliceGroup(A);
+    if (!Group || !Groups.contains(*Group))
+      continue;
+    // Markers travel whole, including those of slices whose own wrappers stay
+    // behind. Selection picks the lowest slice at or above the requested
+    // version, so dropping a marker can hand the group to a higher slice.
+    std::optional<CapturedSlice> Slice = getCapturedSlice(A);
+    if (!Slice || Copies(Slice->Kind)) {
+      Accessor->addAttr(
+          cloneReceivedAPINotesAttr(S.Context, A, *Group + GroupOffset));
+      CopiesType |= Slice && (Slice->Kind == attr::SwiftType ||
+                              Slice->Kind == attr::SwiftNullability);
+    }
+  }
+
+  // The accessor's type derives from the property's, so the collapse derives
+  // it again from the property's as written once the winners apply.
+  if (const auto *Prop = dyn_cast<ObjCPropertyDecl>(Property);
+      Prop && CopiesType)
+    Accessor->addAttr(SwiftVersionedPropertyTypeAttr::CreateImplicit(
+        S.Context,
+        S.Context.getTrivialTypeSourceInfo(Prop->getType(),
+                                           Prop->getLocation()),
+        Prop->getPropertyAttributes() &
+            ObjCPropertyAttribute::kind_null_resettable));
+  return true;
 }
 
 bool clang::instantiateCapturedAPINotesType(
