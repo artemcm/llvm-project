@@ -8656,11 +8656,20 @@ Decl *ASTReader::GetDecl(GlobalDeclID ID) {
 
   if (!DeclsLoaded[Index]) {
     ReadDeclRecord(ID);
+    collapseVersionedAPINotes(DeclsLoaded[Index]);
     if (DeserializationListener)
       DeserializationListener->DeclRead(ID, DeclsLoaded[Index]);
   }
 
   return DeclsLoaded[Index];
+}
+
+void ASTReader::collapseVersionedAPINotes(Decl *D) {
+  // A compilation that captures is a producer. It must not apply, or the
+  // version it happened to be built at would be the one every importer sees.
+  if (!ReadVersionedAPINotesSlice || !APINotesSwiftVersion)
+    return;
+  Sema::CollapseVersionedAPINotes(getContext(), D, *APINotesSwiftVersion);
 }
 
 LocalDeclID ASTReader::mapGlobalIDToModuleFileGlobalID(ModuleFile &M,

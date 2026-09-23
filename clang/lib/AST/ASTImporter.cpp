@@ -9848,6 +9848,14 @@ Expected<Attr *> ASTImporter::Import(const Attr *FromAttr) {
                   From->args_size());
     break;
   }
+  case attr::SwiftVersionedAddition: {
+    // The attribute an API notes slice wraps belongs to the source context.
+    const auto *From = cast<SwiftVersionedAdditionAttr>(FromAttr);
+    AI.importAttr(From, From->getVersion(),
+                  AI.importArg(From->getAdditionalAttr()).value(),
+                  From->getIsReplacedByActive(), From->getSliceGroup());
+    break;
+  }
   default: {
     // The default branch works for attributes that have no arguments to import.
     // FIXME: Handle every attribute type that has arguments of type to import

@@ -48,7 +48,10 @@ void ASTMergeAction::ExecuteAction() {
     std::unique_ptr<ASTUnit> Unit = ASTUnit::LoadFromASTFile(
         ASTFiles[I], CI.getPCHContainerReader(), ASTUnit::LoadEverything,
         CI.getVirtualFileSystemPtr(), nullptr, Diags, CI.getFileSystemOpts(),
-        CI.getHeaderSearchOpts());
+        CI.getHeaderSearchOpts(), /*LangOpts=*/nullptr,
+        /*OnlyLocalDecls=*/false, CaptureDiagsKind::None,
+        /*AllowASTWithCompilerErrors=*/false, /*UserFilesAreVolatile=*/false,
+        CI.getAPINotesCollapseVersion());
 
     if (!Unit)
       continue;

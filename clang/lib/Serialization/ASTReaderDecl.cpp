@@ -3282,6 +3282,9 @@ Attr *ASTRecordReader::readAttr() {
   // Kind is stored as a 1-based integer because 0 is used to indicate a null
   // Attr pointer.
   auto Kind = static_cast<attr::Kind>(V - 1);
+  // Arms the API notes collapse; see ASTReader::collapseVersionedAPINotes.
+  if (Kind == attr::SwiftVersionedSlice)
+    Reader->ReadVersionedAPINotesSlice = true;
   ASTContext &Context = getContext();
 
   IdentifierInfo *AttrName = Record.readIdentifier();
@@ -4548,6 +4551,10 @@ void ASTReader::loadDeclUpdateRecords(PendingUpdateRecord &Record) {
       ASTDeclReader Reader(*this, Record, RecordLocation(F, Offset), ID,
                            SourceLocation());
       Reader.UpdateDecl(D);
+      // An update can install a whole attribute list, captured API notes slices
+      // included: instantiating a class template definition copies the
+      // pattern's. Collapse them as GetDecl would have.
+      collapseVersionedAPINotes(D);
 
       // We might have made this declaration interesting. If so, remember that
       // we need to hand it off to the consumer.

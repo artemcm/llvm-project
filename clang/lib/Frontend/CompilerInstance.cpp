@@ -587,6 +587,14 @@ void CompilerInstance::createASTContext() {
 
 // ExternalASTSource
 
+std::optional<llvm::VersionTuple>
+CompilerInstance::getAPINotesCollapseVersion() const {
+  if (getLangOpts().capturesVersionIndependentAPINotes(
+          getPreprocessorOpts().GeneratePreamble))
+    return std::nullopt;
+  return getAPINotesOpts().SwiftVersion;
+}
+
 namespace {
 // Helper to recursively read the module names for all modules we're adding.
 // We mark these as known and redirect any attempt to load that module to
@@ -646,7 +654,7 @@ void CompilerInstance::createPCHExternalASTSource(
       getASTContext(), getPCHContainerReader(), getCodeGenOpts(),
       getFrontendOpts().ModuleFileExtensions, DependencyCollectors,
       DeserializationListener, OwnDeserializationListener, Preamble,
-      getFrontendOpts().UseGlobalModuleIndex);
+      getFrontendOpts().UseGlobalModuleIndex, getAPINotesCollapseVersion());
 }
 
 IntrusiveRefCntPtr<ASTReader> CompilerInstance::createPCHExternalASTSource(
@@ -658,7 +666,8 @@ IntrusiveRefCntPtr<ASTReader> CompilerInstance::createPCHExternalASTSource(
     ArrayRef<std::shared_ptr<ModuleFileExtension>> Extensions,
     ArrayRef<std::shared_ptr<DependencyCollector>> DependencyCollectors,
     void *DeserializationListener, bool OwnDeserializationListener,
-    bool Preamble, bool UseGlobalModuleIndex) {
+    bool Preamble, bool UseGlobalModuleIndex,
+    std::optional<llvm::VersionTuple> APINotesSwiftVersion) {
   const HeaderSearchOptions &HSOpts =
       PP.getHeaderSearchInfo().getHeaderSearchOpts();
 
@@ -669,6 +678,7 @@ IntrusiveRefCntPtr<ASTReader> CompilerInstance::createPCHExternalASTSource(
       HSOpts.ModulesValidateSystemHeaders,
       HSOpts.ModulesForceValidateUserHeaders,
       HSOpts.ValidateASTInputFilesContent, UseGlobalModuleIndex);
+  Reader->setAPINotesSwiftVersion(APINotesSwiftVersion);
 
   // We need the external source to be set up before we read the AST, because
   // eagerly-deserialized declarations may use it.
@@ -1801,6 +1811,7 @@ void CompilerInstance::createASTReader() {
       +HSOpts.ModulesForceValidateUserHeaders,
       +HSOpts.ValidateASTInputFilesContent,
       +getFrontendOpts().UseGlobalModuleIndex, std::move(ReadTimer));
+  TheASTReader->setAPINotesSwiftVersion(getAPINotesCollapseVersion());
   if (hasASTConsumer()) {
     TheASTReader->setDeserializationListener(
         getASTConsumer().GetASTDeserializationListener());

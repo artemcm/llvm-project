@@ -30,6 +30,14 @@ namespace api_notes {
 
 class APINotesReader;
 
+/// Whether a lookup's slice for Swift version \p Slice can be selected at
+/// \p Requested. A lookup selects its lowest such slice, or else its
+/// unversioned one; with no version requested, no versioned slice can win.
+inline bool isSliceSelectable(llvm::VersionTuple Slice,
+                              llvm::VersionTuple Requested) {
+  return !Requested.empty() && Slice >= Requested;
+}
+
 /// The API notes manager helps find API notes associated with declarations.
 ///
 /// API notes are externally-provided annotations for declarations that can
