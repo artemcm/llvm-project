@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Sema/SemaObjC.h"
+#include "SemaAPINotesInternal.h"
 #include "clang/AST/ASTMutationListener.h"
 #include "clang/AST/EvaluatedExprVisitor.h"
 #include "clang/AST/StmtObjC.h"
@@ -1447,14 +1448,14 @@ void SemaObjC::AddCFAuditedAttribute(Decl *D) {
   if (!IdLoc.getLoc().isValid())
     return;
 
-  // Don't add a redundant or conflicting attribute.
-  if (D->hasAttr<CFAuditedTransferAttr>() ||
-      D->hasAttr<CFUnknownTransferAttr>())
-    return;
-
   AttributeCommonInfo Info(IdLoc.getIdentifierInfo(),
                            SourceRange(IdLoc.getLoc()),
                            AttributeCommonInfo::Form::Pragma());
+
+  // Don't add a redundant or conflicting attribute.
+  if (!inferAfterAPINotes(SemaRef, D, attr::CFAuditedTransfer, &Info))
+    return;
+
   D->addAttr(CFAuditedTransferAttr::CreateImplicit(Context, Info));
 }
 
