@@ -686,7 +686,10 @@ CrossTranslationUnitContext::ASTLoader::loadFromDump(StringRef ASTDumpPath) {
   return ASTUnit::LoadFromASTFile(
       ASTDumpPath, CI.getPCHContainerOperations()->getRawReader(),
       ASTUnit::LoadEverything, CI.getVirtualFileSystemPtr(), DiagOpts, Diags,
-      CI.getFileSystemOpts(), CI.getHeaderSearchOpts());
+      CI.getFileSystemOpts(), CI.getHeaderSearchOpts(), /*LangOpts=*/nullptr,
+      /*OnlyLocalDecls=*/false, CaptureDiagsKind::None,
+      /*AllowASTWithCompilerErrors=*/false, /*UserFilesAreVolatile=*/false,
+      CI.getAPINotesCollapseVersion());
 }
 
 /// Load the AST from a source-file, which is supposed to be located inside the

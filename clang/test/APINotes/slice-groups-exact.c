@@ -12,28 +12,43 @@
 // slice-groups.c covers the other way a second group arises, two readers via
 // export_as. This one cannot be expressed with one lookup per reader, so it is
 // the test that pins the group to the lookup rather than to the reader.
+//
+// Under -fswift-version-independent-apinotes the module build captures every
+// slice and this translation unit collapses them at its own version. The bar
+// is the default mode, so each check runs against both with the same
+// expectations.
 
 // RUN: rm -rf %t && mkdir -p %t
-// RUN: %clang_cc1 -fswift-version-independent-apinotes -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/ModulesCache -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupExactProbe -x c | FileCheck %s
+
+// With no requested version, only the unversioned slices can win.
+// RUN: %clang_cc1 -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/def-none -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupExactProbe -x c | FileCheck --check-prefix=NOVERSION %s
+// RUN: %clang_cc1 -fswift-version-independent-apinotes -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/cap-none -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupExactProbe -x c | FileCheck --check-prefix=NOVERSION %s
+
+// At Swift 3 each lookup's 3.0 slice wins its own group.
+// RUN: %clang_cc1 -fapinotes-swift-version=3 -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/def-v3 -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupExactProbe -x c | FileCheck --check-prefix=V3 %s
+// RUN: %clang_cc1 -fswift-version-independent-apinotes -fapinotes-swift-version=3 -fmodules -fimplicit-module-maps -fmodules-cache-path=%t/cap-v3 -fdisable-module-hash -fapinotes-modules -I %S/Inputs/Headers %s -ast-dump -ast-dump-filter sliceGroupExactProbe -x c | FileCheck --check-prefix=V3 %s
 
 #include "SliceGroupsExact.h"
 
-// CHECK: Dumping sliceGroupExactProbe:
-// CHECK: FunctionDecl {{.+}} imported in SliceGroupsExact sliceGroupExactProbe
+// Both lookups' winners are applied: the broad one, then the exact one, which
+// displaces it. The displaced name is re-wrapped under the exact lookup's
+// group, 1, and each group's losing 3.0 slice keeps its own group.
+// NOVERSION: Dumping sliceGroupExactProbe:
+// NOVERSION: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 0{{$}}
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "broadV3(_:)"
+// NOVERSION-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 IsReplacedByActive 1{{$}}
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "broadUnversioned(_:)"
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "exactUnversioned(_:)"
+// NOVERSION-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 1{{$}}
+// NOVERSION-NEXT: SwiftNameAttr {{.+}} "exactV3(_:)"
 
-// The broad lookup's two slices share one group.
-// CHECK: SwiftVersionedSliceAttr {{.+}} Implicit 0 0{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 0{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "broadUnversioned(_:)"
-// CHECK-NEXT: SwiftVersionedSliceAttr {{.+}} Implicit 3.0 0{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 0{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "broadV3(_:)"
-
-// The exact lookup's two slices share a different group. The trailing 1 is the
-// assertion: it must not be 0, or the two competitions have been pooled.
-// CHECK-NEXT: SwiftVersionedSliceAttr {{.+}} Implicit 0 1{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 0 1{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "exactUnversioned(_:)"
-// CHECK-NEXT: SwiftVersionedSliceAttr {{.+}} Implicit 3.0 1{{$}}
-// CHECK-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 1{{$}}
-// CHECK-NEXT: SwiftNameAttr {{.+}} "exactV3(_:)"
+// Two winners at 3.0, one per group. Pooled, the four slices would have
+// elected a single one.
+// V3: Dumping sliceGroupExactProbe:
+// V3: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 IsReplacedByActive 0{{$}}
+// V3-NEXT: SwiftNameAttr {{.+}} "broadUnversioned(_:)"
+// V3-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 IsReplacedByActive 1{{$}}
+// V3-NEXT: SwiftNameAttr {{.+}} "exactUnversioned(_:)"
+// V3-NEXT: SwiftVersionedAdditionAttr {{.+}} Implicit 3.0 IsReplacedByActive 1{{$}}
+// V3-NEXT: SwiftNameAttr {{.+}} "broadV3(_:)"
+// V3-NEXT: SwiftNameAttr {{.+}} "exactV3(_:)"
