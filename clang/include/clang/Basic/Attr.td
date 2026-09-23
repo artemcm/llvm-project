@@ -3398,8 +3398,19 @@ def SwiftVersionedSlice : Attr {
   //
   // SliceGroup says which group this slice came from. See the
   // SwiftVersionedAddition comment above.
+  //
+  // Origin says where the group came from: the declaration's own lookup, a
+  // previous declaration that this redeclaration inherits from, or the
+  // property whose implicit accessor this is. For the last two only the
+  // group's winner applies, and only as far as the attribute it leaves live
+  // there would have reached this declaration: by inheritance, or as the copy
+  // an accessor gets.
   let Spellings = [];
-  let Args = [VersionArgument<"Version">, UnsignedArgument<"SliceGroup">];
+  let Args = [VersionArgument<"Version">, UnsignedArgument<"SliceGroup">,
+              EnumArgument<"Origin", "OriginKind", /*is_string=*/false,
+                           ["own", "inherited", "copied"],
+                           ["FromOwnLookup", "FromRedeclaration",
+                            "FromProperty"]>];
   let SemaHandler = 0;
   let Documentation = [InternalOnly];
 }

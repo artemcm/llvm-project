@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SemaAPINotesInternal.h"
 #include "TypeLocBuilder.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -3299,6 +3300,21 @@ static void diagnoseMissingConstinit(Sema &S, const VarDecl *InitDecl,
   }
 }
 
+/// Whether an attribute of this kind would inherit onto a redeclaration.
+///
+/// Mirrors InheritableAttr::classof, for the cases that name a kind rather than
+/// hold an attribute.
+static bool isInheritableAttrKind(attr::Kind K) {
+  return K >= attr::FirstInheritableAttr && K <= attr::LastInheritableAttr;
+}
+
+/// Whether an attribute of this kind would inherit onto a redeclaration's
+/// parameter. Mirrors InheritableParamAttr::classof.
+static bool isInheritableParamAttrKind(attr::Kind K) {
+  return K >= attr::FirstInheritableParamAttr &&
+         K <= attr::LastInheritableParamAttr;
+}
+
 void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
                                AvailabilityMergeKind AMK) {
   if (UsedAttr *OldAttr = Old->getMostRecentDecl()->getAttr<UsedAttr>()) {
@@ -3352,6 +3368,8 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
 
   // Attributes declared post-definition are currently ignored.
   checkNewAttributesAfterDef(*this, New, Old);
+
+  diagnoseCapturedSwiftNameConflict(*this, New, Old);
 
   if (AsmLabelAttr *NewA = New->getAttr<AsmLabelAttr>()) {
     if (AsmLabelAttr *OldA = Old->getAttr<AsmLabelAttr>()) {
@@ -3450,6 +3468,17 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
       foundAny = true;
   }
 
+  // Under -fswift-version-independent-apinotes, API notes are captured rather
+  // than applied, and what inheritance would copy is captured too.
+  if (propagateCapturedAPINotes(
+          *this, New, Old, SwiftVersionedSliceAttr::FromRedeclaration,
+          [&](attr::Kind K) {
+            if (isAvailabilityAttrKind(K))
+              return AMK == AvailabilityMergeKind::Redeclaration;
+            return isInheritableAttrKind(K);
+          }))
+    foundAny = true;
+
   if (mergeAlignedAttrs(*this, New, Old))
     foundAny = true;
 
@@ -3510,6 +3539,11 @@ static void mergeParamDeclAttributes(ParmVarDecl *newDecl,
         // 'this' parameter, as the attribute is applied to the function type in
         // that case.
         found += propagateAttribute<LifetimeBoundAttr>(To, From, S);
+        found += propagateCapturedAPINotes(
+            S, To, From, SwiftVersionedSliceAttr::FromRedeclaration,
+            [](attr::Kind K) {
+              return isInheritableParamAttrKind(K) || K == attr::LifetimeBound;
+            });
         return found;
       });
 }

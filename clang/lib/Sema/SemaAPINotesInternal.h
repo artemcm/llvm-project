@@ -10,6 +10,7 @@
 #define LLVM_CLANG_LIB_SEMA_SEMAAPINOTESINTERNAL_H
 
 #include "clang/APINotes/Types.h"
+#include "clang/AST/Attr.h"
 #include "clang/Basic/AttrKinds.h"
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -95,6 +96,23 @@ struct APINotesSelectorDiagnosticState {
   void diagnoseUnused(Sema &S) const;
 };
 
+/// Pass the API notes slices captured on \p Old on to \p New under
+/// -fswift-version-independent-apinotes, for the annotations the default mode
+/// would pass on: those of a kind \p Inherits accepts. \p Origin says how:
+/// FromRedeclaration or FromProperty.
+///
+/// \returns Whether anything was added to \p New.
+bool propagateCapturedAPINotes(Sema &S, Decl *New, const Decl *Old,
+                               SwiftVersionedSliceAttr::OriginKind Origin,
+                               llvm::function_ref<bool(attr::Kind)> Inherits);
+
+/// Whether \p K is one of the availability kinds that inheritance and accessor
+/// synthesis copy together: deprecated, unavailable and availability.
+inline bool isAvailabilityAttrKind(attr::Kind K) {
+  return K == attr::Deprecated || K == attr::Unavailable ||
+         K == attr::Availability;
+}
+
 /// Whether \p D's attributes suppress an inference Sema makes after API notes
 /// apply, of an attribute of kind \p Kind: ns_returns_retained for a method of
 /// an ARC method family, or cf_audited_transfer inside an audited region. Sema
@@ -109,6 +127,14 @@ bool isAPINotesInferenceSuppressed(const Decl *D, attr::Kind Kind);
 /// adding the inferred attribute.
 void recordCapturedAPINotesInference(Sema &S, Decl *D, attr::Kind Kind,
                                      bool Inferred);
+
+/// Diagnose, as attribute inheritance would, a redeclaration \p New whose own
+/// Swift name differs from the one it inherits from \p Old, under
+/// -fswift-version-independent-apinotes. Inheritance diagnoses only at the one
+/// Swift version a default-mode build selects, and the consumer of a
+/// capture-mode module has no Sema to diagnose with, so this checks every
+/// Swift version. Call it before \p New inherits anything.
+void diagnoseCapturedSwiftNameConflict(Sema &S, Decl *New, Decl *Old);
 
 } // namespace clang
 

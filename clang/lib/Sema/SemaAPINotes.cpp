@@ -59,12 +59,17 @@ struct VersionedInfoMetadata {
 /// first, so giving each reader an adjacent pair keeps the ordinals in
 /// application order. A consumer needs that order to resolve two groups whose
 /// winners set the same key.
-static unsigned broadSliceGroup(unsigned ReaderIndex) {
-  return 2 * ReaderIndex;
+///
+/// \p Base is one above any group the declaration already carries, as a tag
+/// does that inherited groups from a previous declaration before its own
+/// lookup ran. Groups then number in the order they were attached.
+static unsigned broadSliceGroup(unsigned Base, unsigned ReaderIndex) {
+  return Base + 2 * ReaderIndex;
 }
 
-static unsigned parameterSelectorSliceGroup(unsigned ReaderIndex) {
-  return 2 * ReaderIndex + 1;
+static unsigned parameterSelectorSliceGroup(unsigned Base,
+                                            unsigned ReaderIndex) {
+  return Base + 2 * ReaderIndex + 1;
 }
 
 namespace {
@@ -100,6 +105,15 @@ static std::optional<unsigned> apiNotesSliceGroup(const Attr *A) {
   if (const auto *Marker = dyn_cast<SwiftVersionedSliceAttr>(A))
     return Marker->getSliceGroup();
   return std::nullopt;
+}
+
+/// One above the highest slice group \p D carries, or zero.
+static unsigned nextSliceGroup(const Decl *D) {
+  unsigned Next = 0;
+  for (const auto *A : D->attrs())
+    if (std::optional<unsigned> Group = apiNotesSliceGroup(A))
+      Next = std::max(Next, *Group + 1);
+  return Next;
 }
 
 /// Determine whether this is a multi-level pointer type.
@@ -362,13 +376,17 @@ static void handleAPINotedRetainCountConvention(
   }
 }
 
+/// Whether \p D carries a 'swift_attr' with exactly \p Attribute.
+static bool hasSwiftAttr(const Decl *D, StringRef Attribute) {
+  return llvm::any_of(
+      D->specific_attrs<SwiftAttrAttr>(),
+      [&](const SwiftAttrAttr *A) { return A->getAttribute() == Attribute; });
+}
+
 /// Add a 'swift_attr' unless \p D already carries that exact annotation.
 static void addSwiftAttrIfAbsent(Sema &S, Decl *D, StringRef Attribute) {
-  for (const auto *A : D->specific_attrs<SwiftAttrAttr>())
-    if (A->getAttribute() == Attribute)
-      return;
-
-  D->addAttr(SwiftAttrAttr::Create(S.Context, Attribute));
+  if (!hasSwiftAttr(D, Attribute))
+    D->addAttr(SwiftAttrAttr::Create(S.Context, Attribute));
 }
 
 static void ProcessAPINotes(Sema &S, Decl *D,
@@ -1068,11 +1086,13 @@ static void ProcessVersionedAPINotes(
       // A parameter's notes come from this same lookup and take its
       // selection, so each parameter is marked too. It collapses with its
       // function, but selects from its own markers.
-      D->addAttr(SwiftVersionedSliceAttr::CreateImplicit(S.Context, Version,
-                                                         SliceGroup));
+      D->addAttr(SwiftVersionedSliceAttr::CreateImplicit(
+          S.Context, Version, SliceGroup,
+          SwiftVersionedSliceAttr::FromOwnLookup));
       for (ParmVarDecl *Param : getAPINotedParams(D))
         Param->addAttr(SwiftVersionedSliceAttr::CreateImplicit(
-            S.Context, Version, SliceGroup));
+            S.Context, Version, SliceGroup,
+            SwiftVersionedSliceAttr::FromOwnLookup));
     } else if (Active == IsActive_t::Inactive && Version.empty()) {
       Replacement = IsSubstitution_t::Replacement;
       Version = Info[Selected].first;
@@ -1304,6 +1324,7 @@ void Sema::ProcessAPINotes(Decl *D) {
   auto Readers = APINotes.findAPINotes(D->getLocation());
   if (Readers.empty())
     return;
+  const unsigned GroupBase = nextSliceGroup(D);
 
   auto *DC = D->getDeclContext();
   // Globals.
@@ -1316,7 +1337,8 @@ void Sema::ProcessAPINotes(Decl *D) {
       for (auto [ReaderIndex, Reader] : llvm::enumerate(Readers)) {
         auto Info =
             Reader->lookupGlobalVariable(VD->getName(), APINotesContext);
-        ProcessVersionedAPINotes(*this, VD, Info, broadSliceGroup(ReaderIndex));
+        ProcessVersionedAPINotes(*this, VD, Info,
+                                 broadSliceGroup(GroupBase, ReaderIndex));
       }
 
       return;
@@ -1336,7 +1358,7 @@ void Sema::ProcessAPINotes(Decl *D) {
           auto Info =
               Reader->lookupGlobalFunction(FD->getName(), APINotesContext);
           ProcessVersionedAPINotes(*this, FD, Info,
-                                   broadSliceGroup(ReaderIndex));
+                                   broadSliceGroup(GroupBase, ReaderIndex));
 
           if (ParameterSelectorCandidates)
             processExactAPINotes<api_notes::GlobalFunctionInfo>(
@@ -1345,7 +1367,7 @@ void Sema::ProcessAPINotes(Decl *D) {
                   return Reader->lookupGlobalFunction(FD->getName(), Parameters,
                                                       APINotesContext);
                 },
-                parameterSelectorSliceGroup(ReaderIndex));
+                parameterSelectorSliceGroup(GroupBase, ReaderIndex));
 
           if (ParameterSelectorCandidates) {
             auto &DiagnosticState =
@@ -1372,7 +1394,7 @@ void Sema::ProcessAPINotes(Decl *D) {
       for (auto [ReaderIndex, Reader] : llvm::enumerate(Readers)) {
         auto Info = Reader->lookupObjCClassInfo(Class->getName());
         ProcessVersionedAPINotes(*this, Class, Info,
-                                 broadSliceGroup(ReaderIndex));
+                                 broadSliceGroup(GroupBase, ReaderIndex));
       }
 
       return;
@@ -1383,7 +1405,7 @@ void Sema::ProcessAPINotes(Decl *D) {
       for (auto [ReaderIndex, Reader] : llvm::enumerate(Readers)) {
         auto Info = Reader->lookupObjCProtocolInfo(Protocol->getName());
         ProcessVersionedAPINotes(*this, Protocol, Info,
-                                 broadSliceGroup(ReaderIndex));
+                                 broadSliceGroup(GroupBase, ReaderIndex));
       }
 
       return;
@@ -1428,7 +1450,7 @@ void Sema::ProcessAPINotes(Decl *D) {
           APINotesContext = UnwindTagContext(ParentTag, APINotes);
         auto Info = Reader->lookupTag(LookupName, APINotesContext);
         ProcessVersionedAPINotes(*this, Tag, Info,
-                                 broadSliceGroup(ReaderIndex));
+                                 broadSliceGroup(GroupBase, ReaderIndex));
       }
 
       return;
@@ -1439,7 +1461,7 @@ void Sema::ProcessAPINotes(Decl *D) {
       for (auto [ReaderIndex, Reader] : llvm::enumerate(Readers)) {
         auto Info = Reader->lookupTypedef(Typedef->getName(), APINotesContext);
         ProcessVersionedAPINotes(*this, Typedef, Info,
-                                 broadSliceGroup(ReaderIndex));
+                                 broadSliceGroup(GroupBase, ReaderIndex));
       }
 
       return;
@@ -1453,7 +1475,7 @@ void Sema::ProcessAPINotes(Decl *D) {
       for (auto [ReaderIndex, Reader] : llvm::enumerate(Readers)) {
         auto Info = Reader->lookupEnumConstant(EnumConstant->getName());
         ProcessVersionedAPINotes(*this, EnumConstant, Info,
-                                 broadSliceGroup(ReaderIndex));
+                                 broadSliceGroup(GroupBase, ReaderIndex));
       }
 
       return;
@@ -1523,7 +1545,7 @@ void Sema::ProcessAPINotes(Decl *D) {
           auto Info = Reader->lookupObjCMethod(*Context, SelectorRef,
                                                Method->isInstanceMethod());
           ProcessVersionedAPINotes(*this, Method, Info,
-                                   broadSliceGroup(ReaderIndex));
+                                   broadSliceGroup(GroupBase, ReaderIndex));
         }
       }
     }
@@ -1538,7 +1560,7 @@ void Sema::ProcessAPINotes(Decl *D) {
           auto Info = Reader->lookupObjCProperty(*Context, Property->getName(),
                                                  isInstanceProperty);
           ProcessVersionedAPINotes(*this, Property, Info,
-                                   broadSliceGroup(ReaderIndex));
+                                   broadSliceGroup(GroupBase, ReaderIndex));
         }
       }
 
@@ -1569,7 +1591,7 @@ void Sema::ProcessAPINotes(Decl *D) {
 
             auto Info = Reader->lookupCXXMethod(Context->id, MethodName);
             ProcessVersionedAPINotes(*this, CXXMethod, Info,
-                                     broadSliceGroup(ReaderIndex));
+                                     broadSliceGroup(GroupBase, ReaderIndex));
 
             if (ParameterSelectorCandidates)
               processExactAPINotes<api_notes::CXXMethodInfo>(
@@ -1578,7 +1600,7 @@ void Sema::ProcessAPINotes(Decl *D) {
                     return Reader->lookupCXXMethod(Context->id, MethodName,
                                                    Parameters);
                   },
-                  parameterSelectorSliceGroup(ReaderIndex));
+                  parameterSelectorSliceGroup(GroupBase, ReaderIndex));
 
             if (ParameterSelectorCandidates) {
               auto &DiagnosticState =
@@ -1605,7 +1627,7 @@ void Sema::ProcessAPINotes(Decl *D) {
           if (auto Context = UnwindTagContext(TagContext, APINotes)) {
             auto Info = Reader->lookupField(Context->id, Field->getName());
             ProcessVersionedAPINotes(*this, Field, Info,
-                                     broadSliceGroup(ReaderIndex));
+                                     broadSliceGroup(GroupBase, ReaderIndex));
           }
         }
       }
@@ -1616,7 +1638,7 @@ void Sema::ProcessAPINotes(Decl *D) {
         if (auto Context = UnwindTagContext(TagContext, APINotes)) {
           auto Info = Reader->lookupTag(Tag->getName(), Context);
           ProcessVersionedAPINotes(*this, Tag, Info,
-                                   broadSliceGroup(ReaderIndex));
+                                   broadSliceGroup(GroupBase, ReaderIndex));
         }
       }
     }
@@ -1707,6 +1729,66 @@ static bool isCapturedSwiftName(const Attr *A, unsigned Group,
          Slice->Kind == attr::SwiftName;
 }
 
+/// Apply the winner of a slice group that \p D received from another
+/// declaration, the way the attribute that winner leaves live there reaches
+/// \p D in the default mode: inherited by a redeclaration, under
+/// mergeDeclAttribute's rules for the kinds API notes produce, or copied to a
+/// property's implicit accessor.
+///
+/// \param Payload The winner's attribute, or null for a removal.
+static void applyReceivedWinner(ASTContext &Ctx, Decl *D, const Attr *Payload,
+                                attr::Kind Kind,
+                                SwiftVersionedSliceAttr::OriginKind Origin) {
+  const bool IsInherited = Origin == SwiftVersionedSliceAttr::FromRedeclaration;
+
+  // On the other declaration the slice displaced an attribute, so the default
+  // mode never passes that one on, but D received it all the same, as a plain
+  // copy. The copy goes. A redeclaration's own attributes stay: in the default
+  // mode they never meet the previous declaration's slices. An accessor has
+  // none of its own yet when it receives the property's.
+  auto Displaced = llvm::find_if(D->attrs(), [&](const Attr *A) {
+    return (!IsInherited || A->isInherited()) && isDisplacedBy(A, Kind);
+  });
+  if (Displaced != D->attr_end())
+    D->getAttrs().erase(Displaced);
+  if (!Payload)
+    return;
+
+  // AddPropertyAttrs copies unconditionally.
+  if (!IsInherited) {
+    D->addAttr(Payload->clone(Ctx));
+    return;
+  }
+
+  switch (Payload->getKind()) {
+  case attr::SwiftName:
+    // mergeNameAttr replaces D's own name. A different own name is an error,
+    // which the producer has already diagnosed.
+    D->dropAttr<SwiftNameAttr>();
+    break;
+  case attr::SwiftAttr:
+    // mergeAttrAttr: only an identical swift_attr is a duplicate.
+    if (hasSwiftAttr(D, cast<SwiftAttrAttr>(Payload)->getAttribute()))
+      return;
+    break;
+  case attr::Availability:
+    // An approximation of mergeAvailabilityAttr, which merges versions: D's
+    // own Swift availability wins.
+    if (llvm::any_of(D->attrs(), isSwiftAvailabilityAttr))
+      return;
+    break;
+  default:
+    // DeclHasAttr.
+    if (llvm::any_of(D->attrs(), [&](const Attr *A) {
+          return A->getKind() == Payload->getKind();
+        }))
+      return;
+  }
+  auto *Inherited = cast<InheritableAttr>(Payload->clone(Ctx));
+  Inherited->setInherited(true);
+  D->addAttr(Inherited);
+}
+
 bool clang::isAPINotesInferenceSuppressed(const Decl *D, attr::Kind Kind) {
   switch (Kind) {
   case attr::NSReturnsRetained:
@@ -1732,8 +1814,9 @@ static Attr *createInferredAttr(ASTContext &Ctx, attr::Kind Kind) {
 
 /// Rebuild \p D's attribute list from the slices captured on it, as the
 /// default mode would have left it: a source attribute stays in place, a
-/// winning slice is applied, and a losing slice stays wrapped. An attribute
-/// Sema infers after API notes apply is inferred again.
+/// winning slice is applied, and a losing slice stays wrapped. A group
+/// received from another declaration contributes its winner alone. An
+/// attribute Sema infers after API notes apply is inferred again.
 ///
 /// The list is rebuilt in one walk, in stored order. That is the order the
 /// default mode applies slices in, ascending group and then emission order,
@@ -1744,6 +1827,13 @@ static Attr *createInferredAttr(ASTContext &Ctx, attr::Kind Kind) {
 /// afterwards.
 static void replayCapturedSlices(ASTContext &Context, Decl *D,
                                  const SelectedSlices &Selected) {
+  // The groups D received from another declaration, and how.
+  llvm::SmallDenseMap<unsigned, SwiftVersionedSliceAttr::OriginKind, 8>
+      ReceivedGroups;
+  for (const auto *Marker : D->specific_attrs<SwiftVersionedSliceAttr>())
+    if (Marker->getOrigin() != SwiftVersionedSliceAttr::FromOwnLookup)
+      ReceivedGroups[Marker->getSliceGroup()] = Marker->getOrigin();
+
   AttrVec &Rebuilt = D->getAttrs();
   AttrVec Captured;
   std::swap(Captured, Rebuilt);
@@ -1770,11 +1860,12 @@ static void replayCapturedSlices(ASTContext &Context, Decl *D,
 
     // A marker leads its slice, so a group's first marker is where the default
     // mode runs maybeAttachUnversionedSwiftName, before the group's slices. It
-    // does not for a parameter.
+    // does not for a parameter, or for a group received from elsewhere.
     // Markers themselves have done their job, and the default mode has none.
     if (const auto *Marker = dyn_cast<SwiftVersionedSliceAttr>(A)) {
       const unsigned Group = Marker->getSliceGroup();
-      if (CurrentGroup != Group && !isa<ParmVarDecl>(D)) {
+      if (CurrentGroup != Group && !isa<ParmVarDecl>(D) &&
+          !ReceivedGroups.contains(Group)) {
         CurrentGroup = Group;
         maybeAttachUnversionedSwiftName(
             Context, D, Selected.lookup(Group), Group,
@@ -1799,6 +1890,13 @@ static void replayCapturedSlices(ASTContext &Context, Decl *D,
 
     auto Winner = Selected.find(Group);
     const bool IsWinner = Winner != Selected.end() && Version == Winner->second;
+
+    if (auto Received = ReceivedGroups.find(Group);
+        Received != ReceivedGroups.end()) {
+      if (IsWinner)
+        applyReceivedWinner(Context, D, Payload, Kind, Received->second);
+      continue;
+    }
 
     // ProcessAPINotes skips an UnsafeBufferUsage slice, winner or not, once
     // the attribute is live, as it is when a slice applied before won.
@@ -1845,6 +1943,8 @@ void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
   // Only a capture-mode declaration carries slice markers. The default mode
   // also leaves addition wrappers behind, for the slices that lost, and
   // re-selecting over those would corrupt an already-applied declaration.
+  // A parameter can carry markers its function does not: those of groups
+  // only its own annotations inherited.
   auto Replay = [&](Decl *D) {
     if (!D->hasAttr<SwiftVersionedSliceAttr>())
       return;
@@ -1876,6 +1976,134 @@ void APINotesCollapseUndo::restore() {
       D->setAttrs(*S.Attrs);
   }
   Decls.clear();
+}
+
+//===----------------------------------------------------------------------===//
+// Redeclarations of a capture-mode declaration
+//
+// Under -fswift-version-independent-apinotes, API notes are not applied to a
+// declaration, so the attributes they would add are not there for a
+// redeclaration to inherit. Their slices are, as SwiftVersionedAdditionAttr,
+// SwiftVersionedRemovalAttr and SwiftVersionedSliceAttr, but those are plain
+// Attr, which attribute inheritance skips. So the redeclaration receives the
+// previous declaration's slice groups, marked inherited, and the collapse
+// applies each one's winner the way inheritance would have applied the
+// attribute it left live.
+//===----------------------------------------------------------------------===//
+
+/// Copy an API notes wrapper or slice marker onto another declaration, under a
+/// new slice group. A copied marker records how the group got there.
+static Attr *
+cloneReceivedAPINotesAttr(ASTContext &Ctx, const Attr *A, unsigned Group,
+                          SwiftVersionedSliceAttr::OriginKind Origin) {
+  if (const auto *Addition = dyn_cast<SwiftVersionedAdditionAttr>(A))
+    return SwiftVersionedAdditionAttr::CreateImplicit(
+        Ctx, Addition->getVersion(), Addition->getAdditionalAttr()->clone(Ctx),
+        Addition->getIsReplacedByActive(), Group);
+  if (const auto *Removal = dyn_cast<SwiftVersionedRemovalAttr>(A))
+    return SwiftVersionedRemovalAttr::CreateImplicit(
+        Ctx, Removal->getVersion(), Removal->getRawKind(),
+        Removal->getIsReplacedByActive(), Group);
+  return SwiftVersionedSliceAttr::CreateImplicit(
+      Ctx, cast<SwiftVersionedSliceAttr>(A)->getVersion(), Group, Origin);
+}
+
+bool clang::propagateCapturedAPINotes(
+    Sema &S, Decl *New, const Decl *Old,
+    SwiftVersionedSliceAttr::OriginKind Origin,
+    llvm::function_ref<bool(attr::Kind)> Inherits) {
+  // The default mode applies the selected slice as a real attribute, which
+  // inheritance already handles, and wraps the losing slices only as
+  // per-declaration bookkeeping.
+  if (!S.captureSwiftVersionIndependentAPINotes() || !Old->hasAttrs())
+    return false;
+
+  // Whether the default mode could inherit what this wrapper stands for. A
+  // removal counts: the attribute it takes away is still live on Old, so
+  // inheritance copied it to New, and the removal has to follow it there.
+  auto WrapsInherited = [&](const Attr *A) {
+    std::optional<CapturedSlice> Slice = getCapturedSlice(A);
+    return Slice && Inherits(Slice->Kind);
+  };
+
+  // A group that wraps nothing inheritable stays behind entirely.
+  llvm::SmallDenseSet<unsigned, 8> InheritingGroups;
+  for (const auto *A : Old->attrs())
+    if (WrapsInherited(A))
+      InheritingGroups.insert(*apiNotesSliceGroup(A));
+  if (InheritingGroups.empty())
+    return false;
+
+  // Old's group numbers are unrelated to New's, so they go above New's,
+  // which keeps group order the order the default mode applies things in.
+  const unsigned GroupOffset = nextSliceGroup(New);
+  for (const auto *A : Old->attrs()) {
+    std::optional<unsigned> Group = apiNotesSliceGroup(A);
+    if (!Group || !InheritingGroups.contains(*Group))
+      continue;
+    // Markers travel whole, including those of slices whose own wrappers stay
+    // behind. Selection picks the lowest slice at or above the requested
+    // version, so dropping a marker can hand the group to a higher slice.
+    if (isa<SwiftVersionedSliceAttr>(A) || WrapsInherited(A))
+      New->addAttr(cloneReceivedAPINotesAttr(S.Context, A, *Group + GroupOffset,
+                                             Origin));
+  }
+  return true;
+}
+
+/// The Swift name \p D has at Swift version \p Version, once its captured
+/// slices are applied. \p D is left as it was. Only its own slices can name
+/// it, so its parameters stay as they are.
+static const SwiftNameAttr *getCapturedSwiftNameAt(ASTContext &Ctx, Decl *D,
+                                                   VersionTuple Version) {
+  if (!D->hasAttr<SwiftVersionedSliceAttr>())
+    return D->getAttr<SwiftNameAttr>();
+  APINotesCollapseUndo Undo;
+  Undo.save(D);
+  replayCapturedSlices(Ctx, D, selectCapturedSlices(D, Version));
+  const auto *Name = D->getAttr<SwiftNameAttr>();
+  Undo.restore();
+  return Name;
+}
+
+void clang::diagnoseCapturedSwiftNameConflict(Sema &S, Decl *New, Decl *Old) {
+  if (!S.captureSwiftVersionIndependentAPINotes())
+    return;
+  // Without captured slices on either side, attribute inheritance makes this
+  // check itself.
+  if (!New->hasAttr<SwiftVersionedSliceAttr>() &&
+      !Old->hasAttr<SwiftVersionedSliceAttr>())
+    return;
+  auto MayBeNamed = [](const Decl *D) {
+    return llvm::any_of(D->attrs(), [](const Attr *A) {
+      if (const auto *Addition = dyn_cast<SwiftVersionedAdditionAttr>(A))
+        return isa<SwiftNameAttr>(Addition->getAdditionalAttr());
+      return isa<SwiftNameAttr>(A);
+    });
+  };
+  if (!MayBeNamed(New) || !MayBeNamed(Old))
+    return;
+
+  // Selection changes only at a slice's version, so those versions, plus
+  // none at all, reach every outcome.
+  llvm::SmallVector<VersionTuple, 4> Versions = {VersionTuple()};
+  for (const Decl *D : {New, Old})
+    for (const auto *Marker : D->specific_attrs<SwiftVersionedSliceAttr>())
+      if (!llvm::is_contained(Versions, Marker->getVersion()))
+        Versions.push_back(Marker->getVersion());
+
+  for (VersionTuple Version : Versions) {
+    const auto *OldName = getCapturedSwiftNameAt(S.Context, Old, Version);
+    const auto *NewName = getCapturedSwiftNameAt(S.Context, New, Version);
+    // The check mergeNameAttr makes, at one version.
+    if (!OldName || !NewName || OldName->getName() == NewName->getName() ||
+        NewName->isImplicit())
+      continue;
+    S.Diag(New->getLocation(), diag::err_attributes_are_not_compatible)
+        << NewName << OldName << /*IsRegularKeywordAttribute=*/false;
+    S.Diag(Old->getLocation(), diag::note_conflicting_attribute);
+    return;
+  }
 }
 
 void clang::recordCapturedAPINotesInference(Sema &S, Decl *D, attr::Kind Kind,
