@@ -58,8 +58,26 @@ module Templates {
   header "Templates.h"
 }
 
+module SliceOwner {
+  header "SliceOwner.h"
+}
+
+module SliceHeir {
+  header "SliceHeir.h"
+  export *
+}
+
 module SliceCollapse {
   header "SliceCollapse.h"
+}
+
+module SliceInheritance {
+  header "SliceInheritance.h"
+}
+
+module SliceInheritanceClient {
+  header "SliceInheritanceClient.h"
+  export *
 }
 
 module SwiftImportAs {

@@ -1,0 +1,4 @@
+Name: SliceHeir
+Functions:
+  - Name: renumberProbe
+    SwiftPrivate: true

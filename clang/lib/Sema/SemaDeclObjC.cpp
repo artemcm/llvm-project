@@ -4594,7 +4594,11 @@ static void mergeInterfaceMethodToImpl(Sema &S,
                                             method->getLocation()));
   }
 
-  // Merge nullability of the result type.
+  // Merge nullability of the result type. Under
+  // -fswift-version-independent-apinotes, the collapse merges it again once
+  // API notes apply, and each parameter's too.
+  CapturedMergeRecorder ResultRecorder(S, method, prevMethod,
+                                       SwiftVersionedMergeAttr::Nullability);
   QualType newReturnType
     = mergeTypeNullabilityForRedecl(
         S, method->getReturnTypeSourceRange().getBegin(),
@@ -4604,6 +4608,7 @@ static void mergeInterfaceMethodToImpl(Sema &S,
         prevMethod->getReturnType(),
         prevMethod->getObjCDeclQualifier() & Decl::OBJC_TQ_CSNullability);
   method->setReturnType(newReturnType);
+  ResultRecorder.finish();
 
   // Handle each of the parameters.
   unsigned numParams = method->param_size();
@@ -4613,6 +4618,8 @@ static void mergeInterfaceMethodToImpl(Sema &S,
     ParmVarDecl *prevParam = prevMethod->param_begin()[i];
 
     // Merge nullability.
+    CapturedMergeRecorder Recorder(S, param, prevParam,
+                                   SwiftVersionedMergeAttr::Nullability);
     QualType newParamType
       = mergeTypeNullabilityForRedecl(
           S, param->getLocation(), param->getType(),
@@ -4620,6 +4627,7 @@ static void mergeInterfaceMethodToImpl(Sema &S,
           prevParam->getLocation(), prevParam->getType(),
           prevParam->getObjCDeclQualifier() & Decl::OBJC_TQ_CSNullability);
     param->setType(newParamType);
+    Recorder.finish();
   }
 }
 

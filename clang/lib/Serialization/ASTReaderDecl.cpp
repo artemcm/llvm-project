@@ -3283,7 +3283,7 @@ Attr *ASTRecordReader::readAttr() {
   // Attr pointer.
   auto Kind = static_cast<attr::Kind>(V - 1);
   // Arms the API notes collapse; see ASTReader::collapseVersionedAPINotes.
-  if (Kind == attr::SwiftVersionedSlice)
+  if (Kind == attr::SwiftVersionedSlice || Kind == attr::SwiftVersionedMerge)
     Reader->ReadVersionedAPINotesSlice = true;
   ASTContext &Context = getContext();
 

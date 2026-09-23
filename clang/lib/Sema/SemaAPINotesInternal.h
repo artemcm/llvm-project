@@ -16,6 +16,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include <string>
@@ -24,6 +25,7 @@
 namespace clang {
 class Decl;
 class MultiLevelTemplateArgumentList;
+class NamedDecl;
 class ParmVarDecl;
 class Sema;
 struct APINotesParameterSelectorCandidates;
@@ -107,6 +109,31 @@ struct APINotesSelectorDiagnosticState {
 bool propagateCapturedAPINotes(Sema &S, Decl *Accessor, const Decl *Property,
                                llvm::function_ref<bool(attr::Kind)> Copies);
 
+/// Records a merge Sema runs into \p New from \p From, as a
+/// SwiftVersionedMergeAttr on New, when this compilation captures API notes
+/// and either declaration carries some. The collapse merges again once From's
+/// notes apply. Construct it before the merge and call finish() after.
+class CapturedMergeRecorder {
+public:
+  CapturedMergeRecorder(Sema &S, NamedDecl *New, const Decl *From,
+                        SwiftVersionedMergeAttr::MergeKind Kind);
+
+  /// Record the merge. \returns Whether there is a record.
+  bool finish();
+
+private:
+  Sema &S;
+  NamedDecl *New;
+  NamedDecl *From;
+  SwiftVersionedMergeAttr::MergeKind Kind;
+  bool Records;
+  /// New's attributes before the merge.
+  llvm::SmallPtrSet<const Attr *, 8> Before;
+  /// New's own attributes that the merge can drop for an inherited copy, each
+  /// with the attribute after it.
+  SmallVector<std::pair<Attr *, const Attr *>, 2> Own;
+};
+
 /// Whether \p K is one of the availability kinds that inheritance and accessor
 /// synthesis copy together: deprecated, unavailable and availability.
 inline bool isAvailabilityAttrKind(attr::Kind K) {
@@ -120,6 +147,14 @@ inline bool isAvailabilityAttrKind(attr::Kind K) {
 /// the collapse makes again once it has applied the slices. Call it just
 /// before adding the inferred attribute.
 bool inferAfterAPINotes(Sema &S, Decl *D, attr::Kind Kind);
+
+/// Diagnose, as attribute inheritance would, a redeclaration \p New whose own
+/// Swift name differs from the one it inherits from \p Old, under
+/// -fswift-version-independent-apinotes. Inheritance diagnoses only at the one
+/// Swift version a default-mode build selects, and the consumer of a
+/// capture-mode module has no Sema to diagnose with, so this checks every
+/// Swift version. Call it before \p New inherits anything.
+void diagnoseCapturedSwiftNameConflict(Sema &S, Decl *New, Decl *Old);
 
 /// Instantiate \p A, if it is an API notes slice of a type or nullability
 /// captured on a template pattern, onto the pattern's instantiation \p New, as

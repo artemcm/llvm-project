@@ -8772,6 +8772,29 @@ Decl *ASTReader::GetDecl(GlobalDeclID ID) {
   return DeclsLoaded[Index];
 }
 
+/// Whether \p D, or one of its parameters, merged in a declaration whose API
+/// notes are still captured: one still being read, or waiting for its deduced
+/// type. See SwiftVersionedMergeAttr.
+static bool mergesUncollapsedDecl(const Decl *D) {
+  auto Waits = [&](const Decl *Owner) {
+    return llvm::any_of(Owner->specific_attrs<SwiftVersionedMergeAttr>(),
+                        [&](const SwiftVersionedMergeAttr *Merge) {
+                          const Decl *From = Merge->getFrom();
+                          // A parameter collapses with its function or method.
+                          if (isa<ParmVarDecl>(From))
+                            From = cast<Decl>(From->getDeclContext());
+                          return From != D && Sema::hasCapturedAPINotes(From);
+                        });
+  };
+  if (Waits(D))
+    return true;
+  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+    return llvm::any_of(FD->parameters(), Waits);
+  if (const auto *MD = dyn_cast<ObjCMethodDecl>(D))
+    return llvm::any_of(MD->parameters(), Waits);
+  return false;
+}
+
 void ASTReader::collapseVersionedAPINotes(Decl *D) {
   // A compilation that captures is a producer. It must not apply, or the
   // version it happened to be built at would be the one every importer sees.
@@ -8785,6 +8808,12 @@ void ASTReader::collapseVersionedAPINotes(Decl *D) {
       llvm::is_contained(llvm::make_first_range(PendingDeducedFunctionTypes),
                          FD))
     return;
+  // What D merged in collapses first. One still being read, or waiting for
+  // its deduced type, makes D wait for finishPendingActions too.
+  if (mergesUncollapsedDecl(D)) {
+    PendingAPINotesCollapses.push_back(D);
+    return;
+  }
   Sema::CollapseVersionedAPINotes(getContext(), D, *APINotesSwiftVersion);
 }
 
@@ -10798,7 +10827,8 @@ void ASTReader::finishPendingActions() {
          !PendingDeducedVarTypes.empty() || !PendingDeclChains.empty() ||
          !PendingMacroIDs.empty() || !PendingDeclContextInfos.empty() ||
          !PendingUpdateRecords.empty() ||
-         !PendingObjCExtensionIvarRedeclarations.empty()) {
+         !PendingObjCExtensionIvarRedeclarations.empty() ||
+         !PendingAPINotesCollapses.empty()) {
     // If any identifiers with corresponding top-level declarations have
     // been loaded, load those declarations now.
     using TopLevelDeclsMap =
@@ -10845,6 +10875,10 @@ void ASTReader::finishPendingActions() {
     PendingDeducedFunctionTypes.clear();
     for (FunctionDecl *FD : DeducedFunctions)
       collapseVersionedAPINotes(FD);
+    // What waited for a declaration it merged in collapses now, and the
+    // collapse applies that one's notes first.
+    for (Decl *D : std::exchange(PendingAPINotesCollapses, {}))
+      Sema::CollapseVersionedAPINotes(getContext(), D, *APINotesSwiftVersion);
 
     // Load each variable type that we deferred loading because it was a
     // deduced type that might refer to a local type declared within itself.

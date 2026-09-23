@@ -53,13 +53,15 @@ struct VersionedInfoMetadata {
 
 namespace {
 /// What an API notes addition or removal wrapper records: the group and
-/// version of its slice, and the attribute it adds or the kind it removes.
+/// version of its slice, the attribute it adds or the kind it removes, and
+/// whether the active slice replaced it.
 struct CapturedSlice {
   unsigned Group;
   VersionTuple Version;
   attr::Kind Kind;
   /// The attribute an addition adds; null for a removal.
   Attr *Payload;
+  bool IsReplacedByActive;
 };
 } // namespace
 
@@ -68,11 +70,13 @@ static std::optional<CapturedSlice> getCapturedSlice(const Attr *A) {
   if (const auto *Addition = dyn_cast<SwiftVersionedAdditionAttr>(A)) {
     Attr *Payload = Addition->getAdditionalAttr();
     return CapturedSlice{Addition->getSliceGroup(), Addition->getVersion(),
-                         Payload->getKind(), Payload};
+                         Payload->getKind(), Payload,
+                         Addition->getIsReplacedByActive()};
   }
   if (const auto *Removal = dyn_cast<SwiftVersionedRemovalAttr>(A))
     return CapturedSlice{Removal->getSliceGroup(), Removal->getVersion(),
-                         Removal->getAttrKindToRemove(), nullptr};
+                         Removal->getAttrKindToRemove(), nullptr,
+                         Removal->getIsReplacedByActive()};
   return std::nullopt;
 }
 
@@ -1755,6 +1759,13 @@ void Sema::DiagnoseUnusedAPINotesSelectors() {
 // for the shape being reproduced.
 //===----------------------------------------------------------------------===//
 
+/// Whether \p D itself carries captured API notes: a slice, or a merge whose
+/// collapse waits for them.
+static bool hasCapturedAPINotesAttr(const Decl *D) {
+  return D->hasAttr<SwiftVersionedSliceAttr>() ||
+         D->hasAttr<SwiftVersionedMergeAttr>();
+}
+
 /// The winning slice version of each slice group that has a winner, empty for
 /// an unversioned winner.
 using SelectedSlices = llvm::SmallDenseMap<unsigned, VersionTuple, 8>;
@@ -1786,6 +1797,127 @@ static bool isCapturedSwiftName(const Attr *A, unsigned Group,
   std::optional<CapturedSlice> Slice = getCapturedSlice(A);
   return Slice && Slice->Group == Group && Slice->Version == Version &&
          Slice->Kind == attr::SwiftName;
+}
+
+/// Whether \p D having \p Own keeps mergeDeclAttribute from inheriting
+/// \p Incoming, for the kinds API notes produce. A Swift name never is:
+/// mergeNameAttr replaces D's own.
+static bool keepsFromInheriting(const Attr *Own, const Attr *Incoming) {
+  switch (Incoming->getKind()) {
+  case attr::SwiftName:
+    return false;
+  case attr::SwiftAttr:
+    // mergeAttrAttr: only an identical swift_attr is a duplicate.
+    if (const auto *OwnAttr = dyn_cast<SwiftAttrAttr>(Own))
+      return OwnAttr->getAttribute() ==
+             cast<SwiftAttrAttr>(Incoming)->getAttribute();
+    return false;
+  case attr::Availability:
+    // An approximation of mergeAvailabilityAttr, which merges versions: D's
+    // own Swift availability wins.
+    return isSwiftAvailabilityAttr(Incoming) && isSwiftAvailabilityAttr(Own);
+  case attr::CFAuditedTransfer:
+  case attr::CFUnknownTransfer:
+    // DiagnoseMutualExclusions: either keeps the other out.
+    return isa<CFAuditedTransferAttr, CFUnknownTransferAttr>(Own);
+  default:
+    // DeclHasAttr.
+    return Own->getKind() == Incoming->getKind();
+  }
+}
+
+/// Whether mergeDeclAttribute would inherit \p A onto a declaration that has
+/// the attributes \p Own.
+template <typename RangeT> static bool mayInherit(const Attr *A, RangeT &&Own) {
+  return llvm::none_of(
+      Own, [&](const Attr *O) { return keepsFromInheriting(O, A); });
+}
+
+/// Add \p A to \p D as inherited. An inherited Swift name replaces D's own;
+/// a different own name is an error, which the producer has diagnosed.
+static void addInherited(Decl *D, InheritableAttr *A) {
+  if (isa<SwiftNameAttr>(A))
+    D->dropAttr<SwiftNameAttr>();
+  A->setInherited(true);
+  D->addAttr(A);
+}
+
+/// Whether API notes can add, remove or suppress an attribute like \p A on
+/// some declaration: the kinds ProcessAPINotes applies, those they displace,
+/// and those Sema infers only once they apply. A merge in the collapse
+/// decides these again. For any other kind the producer's merge decided as
+/// the default mode's does, since API notes change neither side.
+static bool isAPINotesKind(const Attr *A) {
+  if (isa<AvailabilityAttr>(A))
+    return isSwiftAvailabilityAttr(A);
+  return isRetainCountConventionAttr(A) ||
+         isa<CFUnknownTransferAttr, EnumExtensibilityAttr, FlagEnumAttr,
+             LifetimeBoundAttr, NoEscapeAttr, NSErrorDomainAttr,
+             ObjCDesignatedInitializerAttr, SwiftAttrAttr, SwiftBridgeAttr,
+             SwiftImportAsNonGenericAttr, SwiftImportPropertyAsAccessorsAttr,
+             SwiftNameAttr, SwiftNewTypeAttr, SwiftObjCMembersAttr,
+             SwiftPrivateAttr, UnavailableAttr, UnsafeBufferUsageAttr>(A);
+}
+
+/// Whether \p A and \p B are the same attribute: kind and arguments.
+static bool isSameAttr(const ASTContext &Ctx, const Attr *A, const Attr *B) {
+  if (A->getKind() != B->getKind())
+    return false;
+  llvm::FoldingSetNodeID IDA, IDB;
+  A->Profile(IDA, Ctx);
+  B->Profile(IDB, Ctx);
+  return IDA == IDB;
+}
+
+/// The attributes the producer's recorded merges inherited into \p D, which
+/// the collapse decides again. D's other inherited attributes come from
+/// merges before the first one recorded, which were exact, and come first:
+/// Decl::addAttr keeps inherited attributes in insertion order, at the front.
+static SmallVector<Attr *, 8> getMergedCopies(const Decl *D) {
+  unsigned Recorded = 0;
+  for (const auto *Merge : D->specific_attrs<SwiftVersionedMergeAttr>())
+    Recorded += Merge->getInheritedCount();
+  SmallVector<Attr *, 8> Inherited;
+  for (Attr *A : D->attrs())
+    if (A->isInherited())
+      Inherited.push_back(A);
+  const unsigned Unrecorded =
+      Inherited.size() > Recorded ? Inherited.size() - Recorded : 0;
+  return {Inherited.begin() + Unrecorded, Inherited.end()};
+}
+
+/// Inherit into \p D what mergeDeclAttributes, or for a parameter
+/// mergeParamDeclAttributes, inherits from \p From once From's API notes
+/// apply. The kinds API notes can change go by the default mode's rules,
+/// decided against D's attributes so far. For any other kind, D inherits what
+/// the producer's merge did, and takes its copy out of \p Copies.
+static void mergeCollapsedAttributes(ASTContext &Ctx, Decl *D, const Decl *From,
+                                     SwiftVersionedMergeAttr::MergeKind Kind,
+                                     SmallVectorImpl<Attr *> &Copies,
+                                     llvm::function_ref<Attr *(Attr *)> Take) {
+  const bool IsParam = Kind == SwiftVersionedMergeAttr::ParameterAttributes;
+  // From can be D: a category method merges with itself.
+  const SmallVector<Attr *, 8> Incoming(From->attrs());
+  for (Attr *A : Incoming) {
+    if (!isa<InheritableAttr>(A) || isa<UsedAttr, RetainAttr>(A) ||
+        (IsParam && !isa<InheritableParamAttr, LifetimeBoundAttr>(A)))
+      continue;
+    if (!isAPINotesKind(A)) {
+      auto *Copy = llvm::find_if(
+          Copies, [&](const Attr *C) { return isSameAttr(Ctx, C, A); });
+      if (Copy != Copies.end()) {
+        D->addAttr(Take(*Copy));
+        Copies.erase(Copy);
+      }
+      continue;
+    }
+    // Only a redeclaration inherits availability.
+    if (!IsParam && isa<AvailabilityAttr, UnavailableAttr>(A) &&
+        Kind != SwiftVersionedMergeAttr::Redeclaration)
+      continue;
+    if (mayInherit(A, D->attrs()))
+      addInherited(D, cast<InheritableAttr>(A->clone(Ctx)));
+  }
 }
 
 /// Whether Sema infers attributes of kind \p Kind only once API notes have
@@ -1860,12 +1992,47 @@ static QualType getAPINotedType(const Decl *D) {
   return cast<ValueDecl>(D)->getType();
 }
 
+/// Whether \p D's type as written, a function's return type, has nullability.
+static bool writesNullability(const Decl *D) {
+  const QualType Written = getWrittenAPINotedType(D);
+  return !Written.isNull() && Written->getNullability();
+}
+
 /// What replaying a declaration's slices did that the rest of its collapse
 /// depends on.
 struct ReplayResult {
   /// For a parameter, whether the function's type follows its new type.
   bool TypeFollows = false;
+  /// Whether the declaration's own notes gave its type nullability.
+  bool OwnNullability = false;
+  /// The merges of types it recorded, which run once the rest of the
+  /// declaration has collapsed.
+  SmallVector<const SwiftVersionedMergeAttr *, 2> TypeMerges;
 };
+
+/// Set the type API notes rewrite on \p D: a method's result type, or its own.
+static void setAPINotedType(Decl *D, QualType Type) {
+  if (auto *Method = dyn_cast<ObjCMethodDecl>(D))
+    Method->setReturnType(Type);
+  else
+    cast<ValueDecl>(D)->setType(Type);
+}
+
+/// mergeParamDeclTypes, and for an @implementation
+/// mergeTypeNullabilityForRedecl: \p D, whose type has no nullability as
+/// written or from its own notes, takes \p From's, which the collapse has
+/// applied From's notes to. The producer's merge gave D From's nullability as
+/// written, which comes off.
+static void mergeCollapsedNullability(ASTContext &Ctx, Decl *D,
+                                      const Decl *From, bool OwnNullability) {
+  if (OwnNullability || writesNullability(D))
+    return;
+  QualType Type = getAPINotedType(D);
+  AttributedType::stripOuterNullability(Type);
+  if (auto Kind = getAPINotedType(From)->getNullability())
+    Type = Ctx.getAttributedType(*Kind, Type, Type);
+  setAPINotedType(D, Type);
+}
 
 /// How replayCapturedSlices treats a declaration.
 struct ReplayOptions {
@@ -1966,15 +2133,19 @@ static bool applyCapturedType(ASTContext &Ctx, Decl *D, const Attr *Payload,
 /// default mode would have left it: a source attribute stays in place, a
 /// winning slice is applied, and a losing slice stays wrapped. A group
 /// received from another declaration contributes its winner alone. An
-/// attribute Sema infers after API notes apply is inferred again.
+/// attribute Sema infers after API notes apply is inferred again, and a merge
+/// the producer recorded runs again.
 ///
 /// The list is rebuilt in one walk, in stored order. That is the order the
 /// default mode applies slices in, ascending group and then emission order,
 /// and the default mode interleaves real attributes and wrappers as it goes,
-/// so walking the same way reproduces its attribute order. Rebuilding rather
-/// than editing also leaves the captured attributes untouched when
-/// ReplayOptions::KeepsCaptured says to, so a producer that collapses to
-/// precompute something for its importers can put them back afterwards.
+/// so walking the same way reproduces its attribute order. The list is a log
+/// of the rest too: a merge record sits where the producer merged, which is
+/// before a tag's own notes and after anything else's, and an inference
+/// record where Sema inferred. Rebuilding rather than editing also leaves the
+/// captured attributes untouched when ReplayOptions::KeepsCaptured says to,
+/// so a producer that collapses to precompute something for its importers
+/// can put them back afterwards.
 static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
                                          const SelectedSlices &Selected,
                                          ReplayOptions Options) {
@@ -1990,6 +2161,11 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
     if (Marker->getOrigin() != SwiftVersionedSliceAttr::FromOwnLookup)
       ReceivedGroups[Marker->getSliceGroup()] = Marker->getOrigin();
 
+  // What the producer's recorded merges inherited, which each record decides
+  // again.
+  SmallVector<Attr *, 8> Copies = getMergedCopies(D);
+  const llvm::SmallPtrSet<const Attr *, 8> IsCopy(Copies.begin(), Copies.end());
+
   AttrVec &Rebuilt = D->getAttrs();
   AttrVec Captured;
   std::swap(Captured, Rebuilt);
@@ -2003,6 +2179,9 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
       continue;
     }
 
+    if (IsCopy.contains(A))
+      continue;
+
     // Where Sema inferred an attribute after API notes applied, or declined
     // to, decide again now that they have.
     if (const auto *Inference = dyn_cast<SwiftVersionedInferenceAttr>(A)) {
@@ -2011,6 +2190,18 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
       if (!Inference->getInferred() && !Suppressed)
         Rebuilt.push_back(createInferredAttr(Context, Kind));
       DropInferred = Inference->getInferred() && Suppressed;
+      continue;
+    }
+
+    // A merge runs again where the producer ran it. A merge of types waits
+    // until the rest of the declaration has collapsed.
+    if (const auto *Merge = dyn_cast<SwiftVersionedMergeAttr>(A)) {
+      if (Merge->getMerge() == SwiftVersionedMergeAttr::Nullability ||
+          Merge->getMerge() == SwiftVersionedMergeAttr::FunctionType)
+        Result.TypeMerges.push_back(Merge);
+      else
+        mergeCollapsedAttributes(Context, D, Merge->getFrom(),
+                                 Merge->getMerge(), Copies, Take);
       continue;
     }
 
@@ -2057,6 +2248,9 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
       if (!IsWinner)
         continue;
       Result.TypeFollows |= applyCapturedType(Context, D, Payload, Origin);
+      Result.OwnNullability |=
+          Origin == SwiftVersionedSliceAttr::FromOwnLookup &&
+          isa<SwiftNullabilityAttr>(Payload);
       continue;
     }
 
@@ -2097,6 +2291,11 @@ static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
                                 Metadata, Kind, [&] { return Take(Payload); });
   }
 
+  // What the producer inherited that no record takes back it decided
+  // exactly, unless API notes produce it.
+  for (Attr *Copy : Copies)
+    if (!isAPINotesKind(Copy))
+      D->addAttr(Take(Copy));
   if (Rebuilt.empty())
     D->dropAttrs();
   return Result;
@@ -2107,42 +2306,109 @@ bool Sema::captureSwiftVersionIndependentAPINotes() {
       PP.getPreprocessorOpts().GeneratePreamble);
 }
 
-void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
-                                     VersionTuple Requested,
-                                     APINotesCollapseUndo *Undo) {
+namespace {
+/// One collapse: a declaration, and what it merged in.
+struct CollapseState {
+  ASTContext &Context;
+  VersionTuple Requested;
+  APINotesCollapseUndo *Undo;
+  llvm::SmallPtrSet<const Decl *, 8> Started;
+};
+} // namespace
+
+/// The declaration \p D collapses with: a parameter collapses with its
+/// function or method.
+static Decl *getCollapsingDecl(Decl *D) {
+  return isa<ParmVarDecl>(D) ? cast<Decl>(D->getDeclContext()) : D;
+}
+
+static void collapseDecl(CollapseState &State, Decl *D);
+
+/// Collapse what \p D merged in, and what its parameters did, so that each of
+/// its merges runs against a declaration whose API notes apply. Producer
+/// order makes merges acyclic, except that a declaration can merge with
+/// itself.
+static void collapseMergedDecls(CollapseState &State, Decl *D) {
+  auto CollapseFroms = [&](const Decl *Owner) {
+    for (const auto *Merge : Owner->specific_attrs<SwiftVersionedMergeAttr>())
+      if (Decl *From = getCollapsingDecl(Merge->getFrom()); From != D)
+        collapseDecl(State, From);
+  };
+  CollapseFroms(D);
+  for (ParmVarDecl *Param : getAPINotedParams(D))
+    CollapseFroms(Param);
+}
+
+static void collapseDecl(CollapseState &State, Decl *D) {
   // A parameter collapses with its function, which builds its type from the
-  // parameters' types.
-  if (!D || isa<ParmVarDecl>(D))
+  // parameters' types. Only a capture-mode declaration carries slice markers
+  // or merge records. The default mode also leaves addition wrappers behind,
+  // for the slices that lost, and re-selecting over those would corrupt an
+  // already-applied declaration.
+  if (!D || isa<ParmVarDecl>(D) || !Sema::hasCapturedAPINotes(D) ||
+      !State.Started.insert(D).second)
     return;
+  collapseMergedDecls(State, D);
+
+  ASTContext &Context = State.Context;
+  APINotesCollapseUndo *Undo = State.Undo;
   auto *FD = dyn_cast<FunctionDecl>(D);
 
-  // Only a capture-mode declaration carries slice markers. The default mode
-  // also leaves addition wrappers behind, for the slices that lost, and
-  // re-selecting over those would corrupt an already-applied declaration. A
-  // parameter can carry markers its function does not: an implicit setter's
-  // parameter receives its property's type.
+  // A parameter can carry markers its function does not: those of groups
+  // only its own annotations inherited, or the records of its own merges.
   auto Replay = [&](Decl *D) -> ReplayResult {
-    if (!D->hasAttr<SwiftVersionedSliceAttr>())
+    if (!hasCapturedAPINotesAttr(D))
       return ReplayResult();
     if (Undo)
       Undo->save(D);
     return replayCapturedSlices(
-        Context, D, selectCapturedSlices(D, Requested),
+        Context, D, selectCapturedSlices(D, State.Requested),
         ReplayOptions{/*KeepsCaptured=*/Undo != nullptr});
   };
-  const bool Replayed = D->hasAttr<SwiftVersionedSliceAttr>();
-  Replay(D);
+  const bool Replayed = hasCapturedAPINotesAttr(D);
+  const ReplayResult Own = Replay(D);
 
   // ProcessAPINotes rebuilds a function's type whenever it changes a
-  // parameter's.
+  // parameter's, before anything merges into it.
   bool TypeChanges = false;
-  for (ParmVarDecl *Param : getAPINotedParams(D))
-    TypeChanges |= Replay(Param).TypeFollows;
+  SmallVector<std::pair<ParmVarDecl *, ReplayResult>, 4> Params;
+  for (ParmVarDecl *Param : getAPINotedParams(D)) {
+    ReplayResult Result = Replay(Param);
+    TypeChanges |= Result.TypeFollows;
+    Params.push_back({Param, std::move(Result)});
+  }
   if (FD && TypeChanges) {
     if (Undo && !Replayed)
       Undo->save(FD);
     rebuildFunctionType(Context, FD, std::nullopt);
   }
+
+  // Then the merges of types, as MergeCompatibleFunctionDecls runs them: each
+  // parameter's nullability, which a function's type doesn't follow, then a C
+  // function's type, which mergeTypes gives it: the type both functions'
+  // notes give, which is the previous one's wherever they agree.
+  for (auto &[Param, Result] : Params)
+    for (const auto *Merge : Result.TypeMerges)
+      mergeCollapsedNullability(Context, Param, Merge->getFrom(),
+                                Result.OwnNullability);
+  for (const auto *Merge : Own.TypeMerges) {
+    if (Merge->getMerge() == SwiftVersionedMergeAttr::Nullability) {
+      mergeCollapsedNullability(Context, D, Merge->getFrom(),
+                                Own.OwnNullability);
+      continue;
+    }
+    QualType Merged = Context.mergeTypes(
+        cast<FunctionDecl>(Merge->getFrom())->getType(), FD->getType());
+    if (!Merged.isNull())
+      FD->setType(Merged);
+  }
+}
+
+void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
+                                     VersionTuple Requested,
+                                     APINotesCollapseUndo *Undo) {
+  CollapseState State{Context, Requested, Undo, {}};
+  collapseDecl(State, D);
 }
 
 void APINotesCollapseUndo::save(Decl *D) {
@@ -2197,14 +2463,67 @@ void APINotesCollapseUndo::restore() {
 }
 
 //===----------------------------------------------------------------------===//
-// A property's accessors
+// Merges into a capture-mode declaration, and a property's accessors
 //
 // Under -fswift-version-independent-apinotes, API notes are not applied to a
-// property, so AddPropertyAttrs would copy its attributes onto its implicit
-// accessors as written. An accessor receives the property's slice groups
-// instead, and the collapse applies each one's winner as the copy it would
-// have got.
+// declaration, so what Sema derives from them when it merges one declaration
+// into another, by attribute inheritance or by merging types, it derives from
+// the declarations as written. Each such merge is recorded, as a
+// SwiftVersionedMergeAttr where it ran, and the collapse runs it again once
+// both declarations' notes apply. A property's implicit accessor is no merge:
+// AddPropertyAttrs copies the property's attributes, so an accessor receives
+// the property's slice groups, and the collapse applies each one's winner as
+// the copy it would have got.
 //===----------------------------------------------------------------------===//
+
+bool Sema::hasCapturedAPINotes(const Decl *D) {
+  return hasCapturedAPINotesAttr(D) ||
+         llvm::any_of(getAPINotedParams(const_cast<Decl *>(D)),
+                      hasCapturedAPINotesAttr);
+}
+
+/// Whether a merge can drop \p A, one of the declaration's own, for the copy
+/// it inherits: mergeNameAttr drops the Swift name, and mergeAvailabilityAttr
+/// a Swift availability it merges. The collapse replays the declaration's own
+/// notes over these before it merges again, so the recorder puts them back.
+static bool isDroppedByMerge(const Attr *A) {
+  return isa<SwiftNameAttr>(A) || isSwiftAvailabilityAttr(A);
+}
+
+CapturedMergeRecorder::CapturedMergeRecorder(
+    Sema &S, NamedDecl *New, const Decl *From,
+    SwiftVersionedMergeAttr::MergeKind Kind)
+    : S(S), New(New), From(cast<NamedDecl>(const_cast<Decl *>(From))),
+      Kind(Kind), Records(S.captureSwiftVersionIndependentAPINotes() &&
+                          (Sema::hasCapturedAPINotes(New) ||
+                           Sema::hasCapturedAPINotes(From))) {
+  if (!Records || !New->hasAttrs())
+    return;
+  const AttrVec &Attrs = New->getAttrs();
+  for (unsigned I = 0, N = Attrs.size(); I != N; ++I) {
+    Before.insert(Attrs[I]);
+    if (!Attrs[I]->isInherited() && isDroppedByMerge(Attrs[I]))
+      Own.push_back({Attrs[I], I + 1 != N ? Attrs[I + 1] : nullptr});
+  }
+}
+
+bool CapturedMergeRecorder::finish() {
+  if (!Records)
+    return false;
+  unsigned Inherited = 0;
+  if (New->hasAttrs())
+    for (const Attr *A : New->attrs())
+      Inherited += A->isInherited() && !Before.contains(A);
+  for (auto [A, Next] : Own) {
+    if (llvm::is_contained(New->attrs(), A))
+      continue;
+    AttrVec &Attrs = New->getAttrs();
+    Attrs.insert(Next ? llvm::find(Attrs, Next) : Attrs.end(), A);
+  }
+  New->addAttr(SwiftVersionedMergeAttr::CreateImplicit(S.Context, From, Kind,
+                                                       Inherited));
+  return true;
+}
 
 /// Copy an API notes wrapper or slice marker onto a property's accessor, under
 /// a new slice group, with a marker that says where the group came from.
@@ -2268,9 +2587,114 @@ bool clang::propagateCapturedAPINotes(
   return true;
 }
 
+/// Add to \p Versions each slice version \p D's collapse selects among: its
+/// own, its parameters', and those of what it merged in.
+static void collectSliceVersions(Decl *D,
+                                 SmallVectorImpl<VersionTuple> &Versions,
+                                 llvm::SmallPtrSetImpl<const Decl *> &Seen) {
+  if (!Seen.insert(D).second)
+    return;
+  auto Collect = [&](const Decl *Owner) {
+    for (const auto *Marker : Owner->specific_attrs<SwiftVersionedSliceAttr>())
+      if (!llvm::is_contained(Versions, Marker->getVersion()))
+        Versions.push_back(Marker->getVersion());
+    for (const auto *Merge : Owner->specific_attrs<SwiftVersionedMergeAttr>())
+      collectSliceVersions(getCollapsingDecl(Merge->getFrom()), Versions, Seen);
+  };
+  Collect(D);
+  for (const ParmVarDecl *Param : getAPINotedParams(D))
+    Collect(Param);
+}
+
+void Sema::collectCapturedSliceVersions(
+    Decl *D, SmallVectorImpl<VersionTuple> &Versions) {
+  llvm::SmallPtrSet<const Decl *, 8> Seen;
+  collectSliceVersions(D, Versions, Seen);
+}
+
+/// Whether \p D can have a Swift name once its API notes apply: it has one,
+/// or a slice that gives one, or it merged in something that can.
+static bool mayBeSwiftNamed(const Decl *D,
+                            llvm::SmallPtrSetImpl<const Decl *> &Seen) {
+  if (!Seen.insert(D).second)
+    return false;
+  return llvm::any_of(D->attrs(), [&](const Attr *A) {
+    if (const auto *Addition = dyn_cast<SwiftVersionedAdditionAttr>(A))
+      return isa<SwiftNameAttr>(Addition->getAdditionalAttr());
+    if (const auto *Merge = dyn_cast<SwiftVersionedMergeAttr>(A))
+      return mayBeSwiftNamed(Merge->getFrom(), Seen);
+    return isa<SwiftNameAttr>(A);
+  });
+}
+
+/// The Swift name \p D has at Swift version \p Version, once its captured API
+/// notes, and those of what it merged in, apply. Everything is left as it
+/// was.
+static const SwiftNameAttr *getCapturedSwiftNameAt(ASTContext &Ctx, Decl *D,
+                                                   VersionTuple Version) {
+  APINotesCollapseUndo Undo;
+  Sema::CollapseVersionedAPINotes(Ctx, D, Version, &Undo);
+  const auto *Name = D->getAttr<SwiftNameAttr>();
+  Undo.restore();
+  return Name;
+}
+
+void clang::diagnoseCapturedSwiftNameConflict(Sema &S, Decl *New, Decl *Old) {
+  if (!S.captureSwiftVersionIndependentAPINotes())
+    return;
+  // Without captured slices on either side, attribute inheritance makes this
+  // check itself.
+  if (!Sema::hasCapturedAPINotes(New) && !Sema::hasCapturedAPINotes(Old))
+    return;
+  llvm::SmallPtrSet<const Decl *, 8> NewSeen, OldSeen;
+  if (!mayBeSwiftNamed(New, NewSeen) || !mayBeSwiftNamed(Old, OldSeen))
+    return;
+
+  // Selection changes only at a slice's version, so those versions, plus
+  // none at all, reach every outcome.
+  llvm::SmallVector<VersionTuple, 4> Versions = {VersionTuple()};
+  llvm::SmallPtrSet<const Decl *, 8> Seen;
+  collectSliceVersions(New, Versions, Seen);
+  collectSliceVersions(Old, Versions, Seen);
+
+  // mergeNameAttr compares the names as written, and reports a conflict
+  // between those itself.
+  const auto *NewWritten = New->getAttr<SwiftNameAttr>();
+  const auto *OldWritten = Old->getAttr<SwiftNameAttr>();
+  auto IsWritten = [](const SwiftNameAttr *Name, const SwiftNameAttr *Written) {
+    return Written && Name->getName() == Written->getName();
+  };
+
+  for (VersionTuple Version : Versions) {
+    const auto *OldName = getCapturedSwiftNameAt(S.Context, Old, Version);
+    const auto *NewName = getCapturedSwiftNameAt(S.Context, New, Version);
+    // The check mergeNameAttr makes, at one version.
+    if (!OldName || !NewName || OldName->getName() == NewName->getName() ||
+        NewName->isImplicit() ||
+        (IsWritten(NewName, NewWritten) && IsWritten(OldName, OldWritten)))
+      continue;
+    S.Diag(New->getLocation(), diag::err_attributes_are_not_compatible)
+        << NewName << OldName << /*IsRegularKeywordAttribute=*/false;
+    S.Diag(Old->getLocation(), diag::note_conflicting_attribute);
+    return;
+  }
+}
+
 bool clang::instantiateCapturedAPINotesType(
     Sema &S, const MultiLevelTemplateArgumentList &TemplateArgs, const Attr *A,
     Decl *New) {
+  // A merge record names a declaration the pattern merged with, and the
+  // default mode's instantiation takes the pattern's attributes as merged.
+  // The kinds API notes produce don't depend on the template's arguments, so
+  // the instantiation merges attributes with the same declaration once its
+  // notes apply. Its types it takes from the pattern's as written, which a
+  // merge of types never reached.
+  if (const auto *Merge = dyn_cast<SwiftVersionedMergeAttr>(A)) {
+    if (Merge->getMerge() != SwiftVersionedMergeAttr::Nullability &&
+        Merge->getMerge() != SwiftVersionedMergeAttr::FunctionType)
+      New->addAttr(A->clone(S.Context));
+    return true;
+  }
   const auto *Addition = dyn_cast<SwiftVersionedAdditionAttr>(A);
   const Attr *Payload = Addition ? Addition->getAdditionalAttr() : nullptr;
   if (!isa_and_nonnull<SwiftTypeAttr, SwiftNullabilityAttr>(Payload))

@@ -9870,6 +9870,13 @@ Expected<Attr *> ASTImporter::Import(const Attr *FromAttr) {
                   From->getIsReplacedByActive(), From->getSliceGroup());
     break;
   }
+  case attr::SwiftVersionedMerge: {
+    // The declaration merged in belongs to the source context.
+    const auto *From = cast<SwiftVersionedMergeAttr>(FromAttr);
+    AI.importAttr(From, AI.importArg(From->getFrom()).value(), From->getMerge(),
+                  From->getInheritedCount());
+    break;
+  }
   default: {
     // The default branch works for attributes that have no arguments to import.
     // FIXME: Handle every attribute type that has arguments of type to import

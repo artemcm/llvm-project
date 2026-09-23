@@ -27,6 +27,11 @@
 // CHECK-NEXT: SwiftNameAttr {{.*}} Inherited "mixFour()"
 // CHECK-EMPTY:
 
+// The other way round, a capture-mode MixB over a default-mode MixA inherits
+// what A has live, and none of the slices A wrapped as its own bookkeeping.
+// RUN: %clang_cc1 -emit-module -fmodules -fmodule-name=MixB -fmodule-file=MixA=%t/A-default.pcm -o %t/B-capture-over-default.pcm -fapinotes-modules -fswift-version-independent-apinotes -I %t %t/module.modulemap -x c 2>/dev/null
+// RUN: %clang_cc1 -fmodules -fmodule-file=MixA=%t/A-default.pcm -fmodule-file=MixB=%t/B-capture-over-default.pcm -fmodule-map-file=%t/module.modulemap -fapinotes-modules -fapinotes-swift-version=4 -I %t %t/use.c -ast-dump -ast-dump-filter mixFunc | FileCheck --implicit-check-not=SwiftVersionedSliceAttr %s
+
 // MixC uses an API that A's notes make unavailable.
 // RUN: %clang_cc1 -emit-module -fmodules -fmodule-name=MixC -fmodule-file=MixA=%t/A-capture.pcm -o %t/C-capture.pcm -fapinotes-modules -fapinotes-swift-version=4 -I %t %t/module.modulemap -x c -verify
 // RUN: %clang_cc1 -emit-module -fmodules -fmodule-name=MixC -fmodule-file=MixA=%t/A-default.pcm -o %t/C-default.pcm -fapinotes-modules -fapinotes-swift-version=4 -I %t %t/module.modulemap -x c -verify
