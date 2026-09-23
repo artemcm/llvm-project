@@ -1709,11 +1709,14 @@ public:
   /// declaration processed in this translation unit.
   void DiagnoseUnusedAPINotesSelectors();
 
-  /// Whether APINotes should be gathered for all applicable Swift language
-  /// versions, without being applied. Leaving clients of the current module
-  /// to select and apply the correct version.
+  /// Whether API notes should be gathered for all applicable Swift language
+  /// versions, without being applied, leaving clients of the current module to
+  /// select and apply the correct version. See
+  /// LangOptions::capturesVersionIndependentAPINotes: a translation unit that
+  /// imports a captured file applies API notes normally, to its own
+  /// declarations and, through CollapseVersionedAPINotes, to the file's.
   bool captureSwiftVersionIndependentAPINotes() {
-    return APINotes.captureVersionIndependentSwift();
+    return getLangOpts().capturesVersionIndependentAPINotes();
   }
   ///@}
 
