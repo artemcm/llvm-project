@@ -1687,8 +1687,10 @@ public:
   /// Such a module carries every slice unapplied, so that one module can serve
   /// clients at any Swift language mode. This selects the slices that apply at
   /// \p Requested and applies them, reproducing the attribute set
-  /// ProcessAPINotes would have produced. A declaration that carries no
-  /// captured slices is left alone.
+  /// ProcessAPINotes would have produced. The merges Sema ran into the
+  /// declaration while its notes were captured, which it records, run again,
+  /// once what they merged in has collapsed too. A declaration that carries
+  /// no captured slices or merges is left alone.
   ///
   /// Static, because it needs no Sema: ASTReader calls it as it reads a
   /// declaration, which can be before Sema exists. Whether to collapse is the
@@ -1697,12 +1699,25 @@ public:
   /// A parameter collapses with its function, so this does nothing to one
   /// directly.
   ///
-  /// \param Undo If given, records what the collapse replaces, so that a
-  /// producer that collapses to see a declaration as an importer would can
-  /// put it back.
+  /// \param Undo If given, records what the collapse replaces, of \p D and of
+  /// what it merged in, so that a producer that collapses to see a declaration
+  /// as an importer would can put everything back.
   static void CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
                                         VersionTuple Requested,
                                         APINotesCollapseUndo *Undo = nullptr);
+
+  /// Whether \p D, or one of its parameters, carries API notes captured under
+  /// -fswift-version-independent-apinotes: slices, or merges that wait for
+  /// them. CollapseVersionedAPINotes leaves anything else alone.
+  static bool hasCapturedAPINotes(const Decl *D);
+
+  /// Add to \p Versions each Swift version at which the selection of \p D's
+  /// captured API notes slices changes: the versions of its own slices, its
+  /// parameters', and those of what it merged in. Together with no version at
+  /// all, these reach every outcome of CollapseVersionedAPINotes.
+  static void
+  collectCapturedSliceVersions(Decl *D,
+                               SmallVectorImpl<VersionTuple> &Versions);
   /// Apply the 'Nullability:' annotation to the specified declaration
   void ApplyNullability(Decl *D, NullabilityKind Nullability);
   /// Apply the 'Type:' annotation to the specified declaration

@@ -1,0 +1,17 @@
+Name: SliceInheritance
+Functions:
+  - Name: sliceInheritanceProbe
+    SwiftName: 'renamedUnversioned()'
+  - Name: sliceMixedProbe
+    SwiftName: 'mixedUnversioned()'
+  - Name: sliceNoInheritProbe
+    NullabilityOfRet: N
+SwiftVersions:
+  - Version: 3.0
+    Functions:
+      - Name: sliceInheritanceProbe
+        SwiftName: 'renamedV3()'
+      - Name: sliceMixedProbe
+        NullabilityOfRet: O
+      - Name: sliceNoInheritProbe
+        NullabilityOfRet: O

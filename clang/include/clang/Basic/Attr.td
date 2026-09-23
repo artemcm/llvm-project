@@ -3410,7 +3410,8 @@ def SwiftVersionedSlice : Attr {
   // Origin says where the group came from: the declaration's own lookup, or
   // the property whose implicit accessor this is. For the latter only the
   // group's winner applies, as the copy of the attribute it leaves live there
-  // that the accessor gets.
+  // that the accessor gets. A redeclaration receives no slices: it records
+  // its merges, as SwiftVersionedMerge.
   let Spellings = [];
   let Args = [VersionArgument<"Version">, UnsignedArgument<"SliceGroup">,
               EnumArgument<"Origin", "OriginKind", /*is_string=*/false,
@@ -3439,6 +3440,37 @@ def SwiftVersionedInference : Attr {
       return static_cast<attr::Kind>(getRawKind());
     }
   }];
+}
+
+def SwiftVersionedMerge : Attr {
+  // This attribute has no spellings as it is only ever created implicitly,
+  // and only under -fswift-version-independent-apinotes.
+  //
+  // Records that Sema merged From into this declaration: attribute
+  // inheritance from a previous declaration, an overridden method or a
+  // protocol requirement; a parameter's attributes or nullability; or a C
+  // function's type. The producer merged From with its API notes captured,
+  // unapplied, so the consumer merges again once they apply. It does so at
+  // this record's place in the attribute list, which is where the merge ran
+  // relative to this declaration's own API notes.
+  //
+  // InheritedCount is how many attributes the producer's merge inherited.
+  // Decl::addAttr keeps inherited attributes at the front of the list, in
+  // order, so the consumer finds them there and decides each one again.
+  let Spellings = [];
+  let Args = [DeclArgument<Named, "From">,
+              EnumArgument<"Merge", "MergeKind", /*is_string=*/false,
+                           ["redeclaration", "override", "protocol",
+                            "optional-protocol", "parameter", "nullability",
+                            "type"],
+                           ["Redeclaration", "Override",
+                            "ProtocolImplementation",
+                            "OptionalProtocolImplementation",
+                            "ParameterAttributes", "Nullability",
+                            "FunctionType"]>,
+              UnsignedArgument<"InheritedCount">];
+  let SemaHandler = 0;
+  let Documentation = [InternalOnly];
 }
 
 def NoDeref : TypeAttr {

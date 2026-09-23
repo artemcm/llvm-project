@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SemaAPINotesInternal.h"
 #include "TypeLocBuilder.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -3299,6 +3300,24 @@ static void diagnoseMissingConstinit(Sema &S, const VarDecl *InitDecl,
   }
 }
 
+/// How a capture-mode merge record says a merge of kind \p AMK runs.
+static SwiftVersionedMergeAttr::MergeKind
+getCapturedMergeKind(AvailabilityMergeKind AMK) {
+  switch (AMK) {
+  case AvailabilityMergeKind::None:
+    llvm_unreachable("no caller merges without availability");
+  case AvailabilityMergeKind::Redeclaration:
+    return SwiftVersionedMergeAttr::Redeclaration;
+  case AvailabilityMergeKind::Override:
+    return SwiftVersionedMergeAttr::Override;
+  case AvailabilityMergeKind::ProtocolImplementation:
+    return SwiftVersionedMergeAttr::ProtocolImplementation;
+  case AvailabilityMergeKind::OptionalProtocolImplementation:
+    return SwiftVersionedMergeAttr::OptionalProtocolImplementation;
+  }
+  llvm_unreachable("unknown availability merge kind");
+}
+
 void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
                                AvailabilityMergeKind AMK) {
   if (UsedAttr *OldAttr = Old->getMostRecentDecl()->getAttr<UsedAttr>()) {
@@ -3352,6 +3371,8 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
 
   // Attributes declared post-definition are currently ignored.
   checkNewAttributesAfterDef(*this, New, Old);
+
+  diagnoseCapturedSwiftNameConflict(*this, New, Old);
 
   if (AsmLabelAttr *NewA = New->getAttr<AsmLabelAttr>()) {
     if (AsmLabelAttr *OldA = Old->getAttr<AsmLabelAttr>()) {
@@ -3407,6 +3428,10 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
   if (!Old->hasAttrs())
     return;
 
+  // Under -fswift-version-independent-apinotes, API notes are captured rather
+  // than applied, so the collapse merges again once they apply.
+  CapturedMergeRecorder Recorder(*this, New, Old, getCapturedMergeKind(AMK));
+
   bool foundAny = New->hasAttrs();
 
   // Ensure that any moving of objects within the allocated map is done before
@@ -3451,6 +3476,9 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
   }
 
   if (mergeAlignedAttrs(*this, New, Old))
+    foundAny = true;
+
+  if (Recorder.finish())
     foundAny = true;
 
   if (!foundAny) New->dropAttrs();
@@ -3501,6 +3529,12 @@ static void propagateAttributes(ParmVarDecl *To, const ParmVarDecl *From,
 /// to the new one.
 static void mergeParamDeclAttributes(ParmVarDecl *newDecl,
                                      const ParmVarDecl *oldDecl, Sema &S) {
+  if (!oldDecl->hasAttrs())
+    return;
+  // Under -fswift-version-independent-apinotes, the collapse merges again once
+  // API notes apply.
+  CapturedMergeRecorder Recorder(S, newDecl, oldDecl,
+                                 SwiftVersionedMergeAttr::ParameterAttributes);
   propagateAttributes(
       newDecl, oldDecl, [&S](ParmVarDecl *To, const ParmVarDecl *From) {
         unsigned found = 0;
@@ -3512,6 +3546,7 @@ static void mergeParamDeclAttributes(ParmVarDecl *newDecl,
         found += propagateAttribute<LifetimeBoundAttr>(To, From, S);
         return found;
       });
+  Recorder.finish();
 }
 
 static bool EquivalentArrayTypes(QualType Old, QualType New,
@@ -3556,6 +3591,10 @@ static bool EquivalentArrayTypes(QualType Old, QualType New,
 static void mergeParamDeclTypes(ParmVarDecl *NewParam,
                                 const ParmVarDecl *OldParam,
                                 Sema &S) {
+  // Under -fswift-version-independent-apinotes, the collapse merges the
+  // nullability again once API notes apply.
+  CapturedMergeRecorder Recorder(S, NewParam, OldParam,
+                                 SwiftVersionedMergeAttr::Nullability);
   if (auto Oldnullability = OldParam->getType()->getNullability()) {
     if (auto Newnullability = NewParam->getType()->getNullability()) {
       if (*Oldnullability != *Newnullability) {
@@ -3576,6 +3615,7 @@ static void mergeParamDeclTypes(ParmVarDecl *NewParam,
       NewParam->setType(NewT);
     }
   }
+  Recorder.finish();
   const auto *OldParamDT = dyn_cast<DecayedType>(OldParam->getType());
   const auto *NewParamDT = dyn_cast<DecayedType>(NewParam->getType());
   if (OldParamDT && NewParamDT &&
@@ -4564,8 +4604,14 @@ bool Sema::MergeCompatibleFunctionDecls(FunctionDecl *New, FunctionDecl *Old,
   // and argument types. Per C11 6.2.7/4, only update the type if the old decl
   // was visible.
   QualType Merged = Context.mergeTypes(Old->getType(), New->getType());
-  if (!Merged.isNull() && MergeTypeWithOld)
+  if (!Merged.isNull() && MergeTypeWithOld) {
     New->setType(Merged);
+    // Under -fswift-version-independent-apinotes, the collapse merges the
+    // types again once both functions' API notes apply.
+    CapturedMergeRecorder(*this, New, Old,
+                          SwiftVersionedMergeAttr::FunctionType)
+        .finish();
+  }
 
   return false;
 }

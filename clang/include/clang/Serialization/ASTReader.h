@@ -1622,6 +1622,10 @@ private:
   /// Whether any declaration read so far carries a captured API notes slice.
   /// Until one does, there is nothing to collapse.
   bool ReadVersionedAPINotesSlice = false;
+  /// Declarations whose API notes collapse waits for one they merged in, still
+  /// being read or waiting for its deduced type. finishPendingActions
+  /// collapses them.
+  SmallVector<Decl *, 4> PendingAPINotesCollapses;
   /// The Swift version to collapse captured API notes slices at, or
   /// std::nullopt to leave them captured. See setAPINotesSwiftVersion.
   std::optional<VersionTuple> APINotesSwiftVersion = VersionTuple();
