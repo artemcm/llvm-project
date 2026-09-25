@@ -855,7 +855,7 @@ enum AttrName { Target, TargetClones, TargetVersion };
 void inferNoReturnAttr(Sema &S, Decl *D);
 
 /// What Sema::CollapseVersionedAPINotes replaced on the declarations it
-/// collapsed, their attribute lists, so it can be put back.
+/// collapsed, their attribute lists and their types, so it can be put back.
 class APINotesCollapseUndo {
 public:
   /// Record \p D's current state. Recording it twice is harmless: restore
@@ -869,6 +869,9 @@ private:
   struct Saved {
     Decl *D;
     std::optional<AttrVec> Attrs;
+    QualType Type;
+    TypeSourceInfo *TypeInfo = nullptr;
+    unsigned Qualifiers = 0;
   };
   SmallVector<Saved, 2> Decls;
 };
@@ -15545,6 +15548,16 @@ public:
                                              SourceLocation DiagLoc,
                                              bool AllowArrayTypes,
                                              bool OverrideExisting);
+
+  /// CheckImplicitNullabilityTypeSpecifier with \p OverrideExisting set: add
+  /// \p Nullability to \p Type, replacing any nullability specifier \p Type
+  /// carries locally. That path emits no diagnostics, so it needs no Sema, and
+  /// the collapse of captured API notes uses it too.
+  ///
+  /// \returns true if nullability cannot be applied, false otherwise.
+  static bool OverrideImplicitNullability(ASTContext &Context, QualType &Type,
+                                          NullabilityKind Nullability,
+                                          bool AllowArrayTypes);
 
   /// Check whether the given variable declaration has a size that fits within
   /// the address space it is declared in. This issues a diagnostic if not.

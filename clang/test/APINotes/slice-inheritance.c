@@ -41,20 +41,16 @@
 // inherits. Both markers still had to travel for selection to come out right:
 // at Swift 3 the versioned slice wins and supplies no name, so none appears.
 // Had its marker been dropped, the unversioned rename would have won instead.
-// V3: imported in SliceInheritanceClient sliceMixedProbe
+// V3: imported in SliceInheritanceClient sliceMixedProbe 'int * _Nullable (void)'
 // V3-EMPTY:
-// V4: imported in SliceInheritanceClient sliceMixedProbe
+// V4: imported in SliceInheritanceClient sliceMixedProbe 'int *(void)'
 // V4-NEXT: SwiftNameAttr {{.*}} Inherited "mixedUnversioned()"
 // V4-EMPTY:
 
-// No slice in the group carries an attribute that inherits, so nothing
-// travels at all.
-//
-// Known gap: the default mode rewrites the declaration's type with the
-// selected nullability, and function type merging carries that type to the
-// redeclaration. Capture mode doesn't apply types yet, so the types printed
-// here differ between the modes and aren't checked.
-// V3: imported in SliceInheritanceClient sliceNoInheritProbe
+// No slice in the group carries an attribute that inherits. Nullability
+// reaches the redeclaration through its type instead, which function type
+// merging carries over.
+// V3: imported in SliceInheritanceClient sliceNoInheritProbe 'int * _Nullable (void)'
 // V3-EMPTY:
-// V4: imported in SliceInheritanceClient sliceNoInheritProbe
+// V4: imported in SliceInheritanceClient sliceNoInheritProbe 'int * _Nonnull (void)'
 // V4-EMPTY:

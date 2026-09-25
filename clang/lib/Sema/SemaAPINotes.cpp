@@ -126,6 +126,39 @@ static bool isIndirectPointerType(QualType Type) {
          Pointee->isMemberPointerType();
 }
 
+/// A replacement type from API notes, parsed, adjusted as the declaration it
+/// replaces the type of requires, and checked. For a function or method, the
+/// type replaced is its result type.
+struct ParsedAPINotesType {
+  /// What the declaration's type becomes.
+  QualType Type;
+  /// What its type source info becomes: the type as parsed.
+  TypeSourceInfo *TypeInfo;
+};
+
+static std::optional<ParsedAPINotesType>
+parseAPINotesType(Sema &S, Decl *D, StringRef TypeString);
+
+/// Parse a 'Type:' or 'ResultType:' for capture, and wrap it as a slice.
+/// Capture parses every slice's type, where the default mode parses only the
+/// selected one, because whoever applies it later may have no parser; so it
+/// also diagnoses every slice's.
+static void captureAPINotesType(Sema &S, Decl *D, StringRef TypeString,
+                                std::optional<ParsedAPINotesType> Parsed,
+                                VersionedInfoMetadata Metadata) {
+  if (!Parsed)
+    return;
+  TypeSourceInfo *Adjusted =
+      Parsed->Type == Parsed->TypeInfo->getType()
+          ? nullptr
+          : S.Context.getTrivialTypeSourceInfo(Parsed->Type, D->getLocation());
+  auto *TypeAttr = SwiftTypeAttr::CreateImplicit(S.Context, TypeString,
+                                                 Parsed->TypeInfo, Adjusted);
+  D->addAttr(SwiftVersionedAdditionAttr::CreateImplicit(
+      S.Context, Metadata.Version, TypeAttr, Metadata.IsReplacement,
+      Metadata.SliceGroup));
+}
+
 static void applyAPINotesType(Sema &S, Decl *decl, StringRef typeString,
                               VersionedInfoMetadata metadata) {
   if (typeString.empty())
@@ -135,16 +168,27 @@ static void applyAPINotesType(Sema &S, Decl *decl, StringRef typeString,
   // Version-independent APINotes add "type" annotations
   // with a versioned attribute for the client to select and apply.
   if (S.captureSwiftVersionIndependentAPINotes()) {
-    auto *typeAttr = SwiftTypeAttr::CreateImplicit(S.Context, typeString);
-    auto *versioned = SwiftVersionedAdditionAttr::CreateImplicit(
-        S.Context, metadata.Version, typeAttr, metadata.IsReplacement,
-        metadata.SliceGroup);
-    decl->addAttr(versioned);
+    captureAPINotesType(S, decl, typeString,
+                        parseAPINotesType(S, decl, typeString), metadata);
   } else {
     if (!metadata.IsActive)
       return;
     S.ApplyAPINotesType(decl, typeString);
   }
+}
+
+static NullabilityKind getNullabilityKind(const SwiftNullabilityAttr *A) {
+  switch (A->getKind()) {
+  case SwiftNullabilityAttr::Kind::NonNull:
+    return NullabilityKind::NonNull;
+  case SwiftNullabilityAttr::Kind::Nullable:
+    return NullabilityKind::Nullable;
+  case SwiftNullabilityAttr::Kind::Unspecified:
+    return NullabilityKind::Unspecified;
+  case SwiftNullabilityAttr::Kind::NullableResult:
+    return NullabilityKind::NullableResult;
+  }
+  llvm_unreachable("unknown nullability");
 }
 
 /// Apply nullability to the given declaration.
@@ -507,52 +551,98 @@ static bool checkAPINotesReplacementType(Sema &S, SourceLocation Loc,
   return false;
 }
 
-void Sema::ApplyAPINotesType(Decl *D, StringRef TypeString) {
-  if (!TypeString.empty() && ParseTypeFromStringCallback) {
-    auto ParsedType = ParseTypeFromStringCallback(TypeString, "<API Notes>",
-                                                  D->getLocation());
-    if (ParsedType.isUsable()) {
-      QualType Type = Sema::GetTypeFromParser(ParsedType.get());
-      auto TypeInfo = Context.getTrivialTypeSourceInfo(Type, D->getLocation());
-      if (auto Var = dyn_cast<VarDecl>(D)) {
-        // Make adjustments to parameter types.
-        if (isa<ParmVarDecl>(Var)) {
-          Type = ObjC().AdjustParameterTypeForObjCAutoRefCount(
-              Type, D->getLocation(), TypeInfo);
-          Type = Context.getAdjustedParameterType(Type);
-        }
-
-        if (!checkAPINotesReplacementType(*this, Var->getLocation(),
-                                          Var->getType(), Type)) {
-          Var->setType(Type);
-          Var->setTypeSourceInfo(TypeInfo);
-        }
-      } else if (auto property = dyn_cast<ObjCPropertyDecl>(D)) {
-        if (!checkAPINotesReplacementType(*this, property->getLocation(),
-                                          property->getType(), Type)) {
-          property->setType(Type, TypeInfo);
-        }
-      } else if (auto field = dyn_cast<FieldDecl>(D)) {
-        if (!checkAPINotesReplacementType(*this, field->getLocation(),
-                                          field->getType(), Type)) {
-          field->setType(Type);
-          field->setTypeSourceInfo(TypeInfo);
-        }
-      } else {
-        llvm_unreachable("API notes allowed a type on an unknown declaration");
-      }
-    }
+/// Rebuild \p FD's type from its parameters' types, and from \p ResultType if
+/// given, as ProcessAPINotes does once API notes changed either. An
+/// unprototyped function takes no parameter types, so it is rebuilt only for a
+/// new result type.
+static void rebuildFunctionType(ASTContext &Ctx, FunctionDecl *FD,
+                                std::optional<QualType> ResultType) {
+  if (const auto *Proto = FD->getType()->getAs<FunctionProtoType>()) {
+    SmallVector<QualType, 4> ParamTypes;
+    for (const ParmVarDecl *Param : FD->parameters())
+      ParamTypes.push_back(Param->getType());
+    FD->setType(Ctx.getFunctionType(ResultType.value_or(Proto->getReturnType()),
+                                    ParamTypes, Proto->getExtProtoInfo()));
+  } else if (ResultType) {
+    FD->setType(Ctx.getFunctionNoProtoType(
+        *ResultType,
+        FD->getType()->castAs<FunctionNoProtoType>()->getExtInfo()));
   }
 }
 
-void Sema::ApplyNullability(Decl *D, NullabilityKind Nullability) {
+/// Install a replacement type on \p D, as ProcessAPINotes does once it has
+/// parsed, adjusted and checked it; for a function or method, its result type.
+/// Needs no Sema.
+static void applyTypeToDecl(ASTContext &Ctx, Decl *D, QualType Type,
+                            TypeSourceInfo *TypeInfo) {
+  if (auto *Var = dyn_cast<VarDecl>(D)) {
+    Var->setType(Type);
+    Var->setTypeSourceInfo(TypeInfo);
+  } else if (auto *Property = dyn_cast<ObjCPropertyDecl>(D)) {
+    Property->setType(Type, TypeInfo);
+  } else if (auto *Field = dyn_cast<FieldDecl>(D)) {
+    Field->setType(Type);
+    Field->setTypeSourceInfo(TypeInfo);
+  } else if (auto *Method = dyn_cast<ObjCMethodDecl>(D)) {
+    Method->setReturnType(Type);
+    Method->setReturnTypeSourceInfo(TypeInfo);
+  } else if (auto *Function = dyn_cast<FunctionDecl>(D)) {
+    rebuildFunctionType(Ctx, Function, Type);
+  } else {
+    llvm_unreachable("API notes allowed a type on an unknown declaration");
+  }
+}
+
+static std::optional<ParsedAPINotesType>
+parseAPINotesType(Sema &S, Decl *D, StringRef TypeString) {
+  if (TypeString.empty() || !S.ParseTypeFromStringCallback)
+    return std::nullopt;
+  auto ParsedType = S.ParseTypeFromStringCallback(TypeString, "<API Notes>",
+                                                  D->getLocation());
+  if (!ParsedType.isUsable())
+    return std::nullopt;
+  QualType Type = Sema::GetTypeFromParser(ParsedType.get());
+  auto *TypeInfo = S.Context.getTrivialTypeSourceInfo(Type, D->getLocation());
+  QualType OrigType;
+  if (auto *Var = dyn_cast<VarDecl>(D)) {
+    // Make adjustments to parameter types.
+    if (isa<ParmVarDecl>(Var)) {
+      Type = S.ObjC().AdjustParameterTypeForObjCAutoRefCount(
+          Type, D->getLocation(), TypeInfo);
+      Type = S.Context.getAdjustedParameterType(Type);
+    }
+    OrigType = Var->getType();
+  } else if (auto *Property = dyn_cast<ObjCPropertyDecl>(D)) {
+    OrigType = Property->getType();
+  } else if (auto *Field = dyn_cast<FieldDecl>(D)) {
+    OrigType = Field->getType();
+  } else if (auto *Method = dyn_cast<ObjCMethodDecl>(D)) {
+    OrigType = Method->getReturnType();
+  } else if (auto *Function = dyn_cast<FunctionDecl>(D)) {
+    OrigType = Function->getReturnType();
+  } else {
+    llvm_unreachable("API notes allowed a type on an unknown declaration");
+  }
+  if (checkAPINotesReplacementType(S, D->getLocation(), OrigType, Type))
+    return std::nullopt;
+  return ParsedAPINotesType{Type, TypeInfo};
+}
+
+void Sema::ApplyAPINotesType(Decl *D, StringRef TypeString) {
+  if (auto Parsed = parseAPINotesType(*this, D, TypeString))
+    applyTypeToDecl(Context, D, Parsed->Type, Parsed->TypeInfo);
+}
+
+/// Apply 'Nullability:' to \p D, as Sema::ApplyNullability does. Needs no
+/// Sema.
+static void applyNullabilityToDecl(ASTContext &Context, Decl *D,
+                                   NullabilityKind Nullability) {
   auto GetModified =
       [&](class Decl *D, QualType QT,
           NullabilityKind Nullability) -> std::optional<QualType> {
     QualType Original = QT;
-    CheckImplicitNullabilityTypeSpecifier(QT, Nullability, D->getLocation(),
-                                          isa<ParmVarDecl>(D),
-                                          /*OverrideExisting=*/true);
+    Sema::OverrideImplicitNullability(Context, QT, Nullability,
+                                      isa<ParmVarDecl>(D));
     return (QT.getTypePtr() != Original.getTypePtr()) ? std::optional(QT)
                                                       : std::nullopt;
   };
@@ -598,6 +688,10 @@ void Sema::ApplyNullability(Decl *D, NullabilityKind Nullability) {
             ObjCPropertyAttribute::kind_null_resettable);
     }
   }
+}
+
+void Sema::ApplyNullability(Decl *D, NullabilityKind Nullability) {
+  applyNullabilityToDecl(Context, D, Nullability);
 }
 
 /// Process API notes for a variable or property.
@@ -731,26 +825,18 @@ static void ProcessAPINotes(Sema &S, FunctionOrMethod AnyFunc,
   if (!Info.SwiftReturnOwnership.empty())
     addSwiftAttrIfAbsent(S, D, "returns_" + Info.SwiftReturnOwnership);
 
-  // Result type override.
-  QualType OverriddenResultType;
-  if (Metadata.IsActive && !Info.ResultType.empty() &&
-      S.ParseTypeFromStringCallback) {
-    auto ParsedType = S.ParseTypeFromStringCallback(
-        Info.ResultType, "<API Notes>", D->getLocation());
-    if (ParsedType.isUsable()) {
-      QualType ResultType = Sema::GetTypeFromParser(ParsedType.get());
-
+  // Result type override. Capture parses every slice's, for whoever applies
+  // it later. A function's type is rebuilt once, below.
+  std::optional<QualType> OverriddenResultType;
+  if (S.captureSwiftVersionIndependentAPINotes()) {
+    captureAPINotesType(S, D, Info.ResultType,
+                        parseAPINotesType(S, D, Info.ResultType), Metadata);
+  } else if (Metadata.IsActive) {
+    if (auto Parsed = parseAPINotesType(S, D, Info.ResultType)) {
       if (MD) {
-        if (!checkAPINotesReplacementType(S, D->getLocation(),
-                                          MD->getReturnType(), ResultType)) {
-          auto ResultTypeInfo =
-              S.Context.getTrivialTypeSourceInfo(ResultType, D->getLocation());
-          MD->setReturnType(ResultType);
-          MD->setReturnTypeSourceInfo(ResultTypeInfo);
-        }
-      } else if (!checkAPINotesReplacementType(
-                     S, FD->getLocation(), FD->getReturnType(), ResultType)) {
-        OverriddenResultType = ResultType;
+        applyTypeToDecl(S.Context, MD, Parsed->Type, Parsed->TypeInfo);
+      } else {
+        OverriddenResultType = Parsed->Type;
         AnyTypeChanged = true;
       }
     }
@@ -758,23 +844,8 @@ static void ProcessAPINotes(Sema &S, FunctionOrMethod AnyFunc,
 
   // If the result type or any of the parameter types changed for a function
   // declaration, we have to rebuild the type.
-  if (FD && AnyTypeChanged) {
-    if (const auto *fnProtoType = FD->getType()->getAs<FunctionProtoType>()) {
-      if (OverriddenResultType.isNull())
-        OverriddenResultType = fnProtoType->getReturnType();
-
-      SmallVector<QualType, 4> ParamTypes;
-      for (auto Param : FD->parameters())
-        ParamTypes.push_back(Param->getType());
-
-      FD->setType(S.Context.getFunctionType(OverriddenResultType, ParamTypes,
-                                            fnProtoType->getExtProtoInfo()));
-    } else if (!OverriddenResultType.isNull()) {
-      const auto *FnNoProtoType = FD->getType()->castAs<FunctionNoProtoType>();
-      FD->setType(S.Context.getFunctionNoProtoType(
-          OverriddenResultType, FnNoProtoType->getExtInfo()));
-    }
-  }
+  if (FD && AnyTypeChanged)
+    rebuildFunctionType(S.Context, FD, OverriddenResultType);
 
   // Retain count convention
   handleAPINotedRetainCountConvention(S, D, Metadata,
@@ -1812,6 +1883,89 @@ static Attr *createInferredAttr(ASTContext &Ctx, attr::Kind Kind) {
   return CFAuditedTransferAttr::CreateImplicit(Ctx);
 }
 
+/// The type API notes rewrite on \p D: a method's return type, or its own.
+static QualType getAPINotedType(const Decl *D) {
+  if (const auto *Method = dyn_cast<ObjCMethodDecl>(D))
+    return Method->getReturnType();
+  if (const auto *Property = dyn_cast<ObjCPropertyDecl>(D))
+    return Property->getType();
+  return cast<ValueDecl>(D)->getType();
+}
+
+/// Apply the winning slice's 'Type:', 'ResultType:' or nullability to \p D,
+/// as ProcessAPINotes applies its own slices'. For a slice \p D received from
+/// another declaration, apply what that declaration's type passes on: its
+/// nullability to a redeclaration, as type merging does, and its type to a
+/// property's implicit accessor, which synthesis derives from it.
+///
+/// \returns Whether \p D's type changed.
+static bool applyCapturedType(ASTContext &Ctx, Decl *D, const Attr *Payload,
+                              SwiftVersionedSliceAttr::OriginKind Origin) {
+  const auto *Type = dyn_cast<SwiftTypeAttr>(Payload);
+  const auto *Nullability = dyn_cast<SwiftNullabilityAttr>(Payload);
+  auto *Method = dyn_cast<ObjCMethodDecl>(D);
+  auto *FD = dyn_cast<FunctionDecl>(D);
+  auto *Value = dyn_cast<ValueDecl>(D);
+  const QualType Before = getAPINotedType(D);
+
+  switch (Origin) {
+  case SwiftVersionedSliceAttr::FromOwnLookup:
+    if (Nullability)
+      applyNullabilityToDecl(Ctx, D, getNullabilityKind(Nullability));
+    else
+      applyTypeToDecl(Ctx, D,
+                      Type->getAdjustedTypeLoc() ? Type->getAdjustedType()
+                                                 : Type->getParsedType(),
+                      Type->getParsedTypeLoc());
+    break;
+
+  case SwiftVersionedSliceAttr::FromRedeclaration: {
+    // mergeParamDeclTypes, and for a C function mergeTypes: nullability, where
+    // the redeclaration has none.
+    const QualType Current = FD ? FD->getReturnType() : Value->getType();
+    if (!Nullability || Current->getNullability())
+      break;
+    const NullabilityKind Kind = getNullabilityKind(Nullability);
+    if (FD)
+      applyNullabilityToDecl(Ctx, D, Kind);
+    else
+      Value->setType(Ctx.getAttributedType(Kind, Current, Current));
+    break;
+  }
+
+  case SwiftVersionedSliceAttr::FromProperty: {
+    // The getter returns the property's type and the setter takes it, with
+    // qualifiers removed. A null_resettable property, which nullability from
+    // API notes makes one, returns nonnull and takes nullable in place of
+    // unspecified.
+    QualType Current = Method ? Method->getReturnType() : Value->getType();
+    if (Type) {
+      Current = Method ? Type->getParsedType().getAtomicUnqualifiedType()
+                       : Type->getParsedType()
+                             .getUnqualifiedType()
+                             .getAtomicUnqualifiedType();
+    } else {
+      NullabilityKind Kind = getNullabilityKind(Nullability);
+      if (!Sema::OverrideImplicitNullability(Ctx, Current, Kind,
+                                             /*AllowArrayTypes=*/false) &&
+          Kind == NullabilityKind::Unspecified &&
+          !isIndirectPointerType(Current)) {
+        AttributedType::stripOuterNullability(Current);
+        Kind = Method ? NullabilityKind::NonNull : NullabilityKind::Nullable;
+        Current = Ctx.getAttributedType(Kind, Current, Current);
+      }
+    }
+    if (Method)
+      Method->setReturnType(Current);
+    else
+      Value->setType(Current);
+    break;
+  }
+  }
+
+  return Before.getAsOpaquePtr() != getAPINotedType(D).getAsOpaquePtr();
+}
+
 /// Rebuild \p D's attribute list from the slices captured on it, as the
 /// default mode would have left it: a source attribute stays in place, a
 /// winning slice is applied, and a losing slice stays wrapped. A group
@@ -1825,8 +1979,13 @@ static Attr *createInferredAttr(ASTContext &Ctx, attr::Kind Kind) {
 /// than editing also leaves the captured attributes untouched, so a producer
 /// that collapses to precompute something for its importers can put them back
 /// afterwards.
-static void replayCapturedSlices(ASTContext &Context, Decl *D,
+///
+/// \returns Whether \p D is a parameter whose type changed in a way its
+/// function's type has to follow.
+static bool replayCapturedSlices(ASTContext &Context, Decl *D,
                                  const SelectedSlices &Selected) {
+  bool FunctionTypeFollows = false;
+
   // The groups D received from another declaration, and how.
   llvm::SmallDenseMap<unsigned, SwiftVersionedSliceAttr::OriginKind, 8>
       ReceivedGroups;
@@ -1890,11 +2049,27 @@ static void replayCapturedSlices(ASTContext &Context, Decl *D,
 
     auto Winner = Selected.find(Group);
     const bool IsWinner = Winner != Selected.end() && Version == Winner->second;
+    auto Received = ReceivedGroups.find(Group);
+    const auto Origin = Received == ReceivedGroups.end()
+                            ? SwiftVersionedSliceAttr::FromOwnLookup
+                            : Received->second;
 
-    if (auto Received = ReceivedGroups.find(Group);
-        Received != ReceivedGroups.end()) {
+    // A type is no attribute. The winner rewrites the declaration's type, and
+    // every other slice leaves nothing, as in the default mode. A C function's
+    // redeclaration takes its type from the previous one's, parameters
+    // included; a C++ one keeps its own.
+    if (isa_and_nonnull<SwiftTypeAttr, SwiftNullabilityAttr>(Payload)) {
+      if (IsWinner && applyCapturedType(Context, D, Payload, Origin) &&
+          isa<ParmVarDecl>(D))
+        FunctionTypeFollows |=
+            Origin != SwiftVersionedSliceAttr::FromRedeclaration ||
+            !Context.getLangOpts().CPlusPlus;
+      continue;
+    }
+
+    if (Origin != SwiftVersionedSliceAttr::FromOwnLookup) {
       if (IsWinner)
-        applyReceivedWinner(Context, D, Payload, Kind, Received->second);
+        applyReceivedWinner(Context, D, Payload, Kind, Origin);
       continue;
     }
 
@@ -1931,12 +2106,14 @@ static void replayCapturedSlices(ASTContext &Context, Decl *D,
 
   if (Rebuilt.empty())
     D->dropAttrs();
+  return FunctionTypeFollows;
 }
 
 void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
                                      VersionTuple Requested,
                                      APINotesCollapseUndo *Undo) {
-  // A parameter collapses with its function.
+  // A parameter collapses with its function, which builds its type from the
+  // parameters' types.
   if (!D || isa<ParmVarDecl>(D))
     return;
 
@@ -1947,14 +2124,32 @@ void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
   // only its own annotations inherited.
   auto Replay = [&](Decl *D) {
     if (!D->hasAttr<SwiftVersionedSliceAttr>())
-      return;
+      return false;
     if (Undo)
       Undo->save(D);
     replayCapturedSlices(Context, D, selectCapturedSlices(D, Requested));
+    return true;
   };
-  Replay(D);
-  for (ParmVarDecl *Param : getAPINotedParams(D))
-    Replay(Param);
+  const bool Replayed = Replay(D);
+
+  // ProcessAPINotes rebuilds a function's type whenever it changes a
+  // parameter's.
+  bool FunctionTypeFollows = false;
+  for (ParmVarDecl *Param : getAPINotedParams(D)) {
+    if (!Param->hasAttr<SwiftVersionedSliceAttr>())
+      continue;
+    if (Undo)
+      Undo->save(Param);
+    FunctionTypeFollows |= replayCapturedSlices(
+        Context, Param, selectCapturedSlices(Param, Requested));
+  }
+
+  auto *FD = dyn_cast<FunctionDecl>(D);
+  if (!FD || !FunctionTypeFollows)
+    return;
+  if (Undo && !Replayed)
+    Undo->save(FD);
+  rebuildFunctionType(Context, FD, std::nullopt);
 }
 
 void APINotesCollapseUndo::save(Decl *D) {
@@ -1962,6 +2157,22 @@ void APINotesCollapseUndo::save(Decl *D) {
   S.D = D;
   if (D->hasAttrs())
     S.Attrs = D->getAttrs();
+  if (auto *Method = dyn_cast<ObjCMethodDecl>(D)) {
+    S.Type = Method->getReturnType();
+    S.TypeInfo = Method->getReturnTypeSourceInfo();
+    S.Qualifiers = Method->getObjCDeclQualifier();
+  } else if (auto *Property = dyn_cast<ObjCPropertyDecl>(D)) {
+    S.Type = Property->getType();
+    S.TypeInfo = Property->getTypeSourceInfo();
+    S.Qualifiers = Property->getPropertyAttributes();
+  } else if (auto *Declarator = dyn_cast<DeclaratorDecl>(D)) {
+    S.Type = Declarator->getType();
+    S.TypeInfo = Declarator->getTypeSourceInfo();
+    // Only an Objective-C method's parameter has qualifiers to set.
+    if (auto *Param = dyn_cast<ParmVarDecl>(D);
+        Param && Param->isObjCMethodParameter())
+      S.Qualifiers = Param->getObjCDeclQualifier();
+  }
   Decls.push_back(std::move(S));
 }
 
@@ -1974,6 +2185,20 @@ void APINotesCollapseUndo::restore() {
       D->getAttrs() = std::move(*S.Attrs);
     else
       D->setAttrs(*S.Attrs);
+    if (auto *Method = dyn_cast<ObjCMethodDecl>(D)) {
+      Method->setReturnType(S.Type);
+      Method->setReturnTypeSourceInfo(S.TypeInfo);
+      Method->setObjCDeclQualifier(Decl::ObjCDeclQualifier(S.Qualifiers));
+    } else if (auto *Property = dyn_cast<ObjCPropertyDecl>(D)) {
+      Property->setType(S.Type, S.TypeInfo);
+      Property->overwritePropertyAttributes(S.Qualifiers);
+    } else if (auto *Declarator = dyn_cast<DeclaratorDecl>(D)) {
+      Declarator->setType(S.Type);
+      Declarator->setTypeSourceInfo(S.TypeInfo);
+      if (auto *Param = dyn_cast<ParmVarDecl>(D);
+          Param && Param->isObjCMethodParameter())
+        Param->setObjCDeclQualifier(Decl::ObjCDeclQualifier(S.Qualifiers));
+    }
   }
   Decls.clear();
 }

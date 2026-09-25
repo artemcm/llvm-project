@@ -3475,6 +3475,10 @@ void Sema::mergeDeclAttributes(NamedDecl *New, Decl *Old,
           [&](attr::Kind K) {
             if (isAvailabilityAttrKind(K))
               return AMK == AvailabilityMergeKind::Redeclaration;
+            // Nullability is part of the type, which only a C function's
+            // redeclaration takes from the previous declaration.
+            if (K == attr::SwiftNullability)
+              return isa<FunctionDecl>(New) && !getLangOpts().CPlusPlus;
             return isInheritableAttrKind(K);
           }))
     foundAny = true;
@@ -3542,7 +3546,9 @@ static void mergeParamDeclAttributes(ParmVarDecl *newDecl,
         found += propagateCapturedAPINotes(
             S, To, From, SwiftVersionedSliceAttr::FromRedeclaration,
             [](attr::Kind K) {
-              return isInheritableParamAttrKind(K) || K == attr::LifetimeBound;
+              // Nullability as mergeParamDeclTypes propagates it.
+              return isInheritableParamAttrKind(K) ||
+                     K == attr::LifetimeBound || K == attr::SwiftNullability;
             });
         return found;
       });

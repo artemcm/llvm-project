@@ -3232,8 +3232,14 @@ def Regparm : TypeAttr {
 def SwiftType : Attr {
   // This attribute has no spellings as it is only ever created implicitly
   // from API notes.
+  //
+  // Capture mode parses the type where it captures it, because whoever
+  // applies it may have no parser. ParsedType is the type as parsed, and
+  // AdjustedType, for a parameter, the type the parameter takes after
+  // adjustment.
   let Spellings = [];
-  let Args = [StringArgument<"TypeString">];
+  let Args = [StringArgument<"TypeString">, TypeArgument<"ParsedType", 1>,
+              TypeArgument<"AdjustedType", 1>];
   let SemaHandler = 0;
   let Documentation = [InternalOnly];
 }
