@@ -8776,6 +8776,15 @@ void ASTReader::collapseVersionedAPINotes(Decl *D) {
   // version it happened to be built at would be the one every importer sees.
   if (!ReadVersionedAPINotesSlice || !APINotesSwiftVersion)
     return;
+  // The collapse rebuilds a function's type from its parameters', and a
+  // deduced return type is read only after the function, so
+  // finishPendingActions collapses it once it has set it, and before it
+  // propagates the type to the function's redeclarations.
+  if (const auto *FD = dyn_cast<FunctionDecl>(D);
+      FD && FD->getDeclaredReturnType()->getContainedAutoType() &&
+      llvm::is_contained(llvm::make_first_range(PendingDeducedFunctionTypes),
+                         FD))
+    return;
   Sema::CollapseVersionedAPINotes(getContext(), D, *APINotesSwiftVersion);
 }
 
@@ -10810,6 +10819,14 @@ void ASTReader::finishPendingActions() {
     for (unsigned I = 0; I != PendingDeducedFunctionTypes.size(); ++I) {
       auto *FD = PendingDeducedFunctionTypes[I].first;
       FD->setType(GetType(PendingDeducedFunctionTypes[I].second));
+
+      // The API notes collapse waited for this type. It runs before the
+      // deduced return type propagates along the redeclaration chain, since
+      // it can rewrite that type: notes on a function whose return type was
+      // deduced before they applied, as an explicit instantiation's was.
+      if (ReadVersionedAPINotesSlice && APINotesSwiftVersion)
+        Sema::CollapseVersionedAPINotes(getContext(), FD,
+                                        *APINotesSwiftVersion);
 
       if (auto *DT = FD->getReturnType()->getContainedDeducedType()) {
         // If we gave a function a deduced return type, remember that we need to

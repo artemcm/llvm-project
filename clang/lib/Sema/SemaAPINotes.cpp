@@ -25,6 +25,8 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Sema/SemaObjC.h"
 #include "clang/Sema/SemaSwift.h"
+#include "clang/Sema/Template.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include <stack>
 
 using namespace clang;
@@ -41,12 +43,18 @@ struct VersionedInfoMetadata {
   unsigned SliceGroup;
   unsigned IsActive : 1;
   unsigned IsReplacement : 1;
+  /// Whether this is the slice selection picks for this compilation's own
+  /// Swift version. Capture mode marks every slice inactive, but diagnoses
+  /// this one's type as the default mode would.
+  unsigned IsProducerSelected : 1;
 
   VersionedInfoMetadata(VersionTuple Version, unsigned SliceGroup,
-                        IsActive_t Active, IsSubstitution_t Replacement)
+                        IsActive_t Active, IsSubstitution_t Replacement,
+                        bool ProducerSelected)
       : Version(Version), SliceGroup(SliceGroup),
         IsActive(Active == IsActive_t::Active),
-        IsReplacement(Replacement == IsSubstitution_t::Replacement) {}
+        IsReplacement(Replacement == IsSubstitution_t::Replacement),
+        IsProducerSelected(ProducerSelected) {}
 };
 } // end anonymous namespace
 
@@ -103,25 +111,82 @@ struct ParsedAPINotesType {
 };
 } // namespace
 
+static std::optional<ParsedAPINotesType>
+parseAPINotesType(Sema &S, Decl *D, StringRef TypeString, bool Diagnose = true);
+
+/// Whether \p D's type, or a function's return type, is still to be deduced.
+/// The default mode applies API notes to the type as written, and deduction
+/// then replaces it with the initializer's or the body's, notes and all. A type
+/// already deduced, as on the explicit instantiation of a specialization that
+/// an implicit one deduced first, takes them as any other does.
+static bool isAPINotedTypeUndeduced(const Decl *D) {
+  QualType Type;
+  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+    Type = FD->getReturnType();
+  else if (const auto *VD = dyn_cast<ValueDecl>(D))
+    Type = VD->getType();
+  return !Type.isNull() && Type->isUndeducedType();
+}
+
+/// Parse a 'Type:' or 'ResultType:' for capture, and wrap it as a slice.
+/// Capture parses every slice's type, where the default mode parses only the
+/// selected one, because whoever applies it later may have no parser. Only the
+/// slice selected for this compilation's own Swift version is diagnosed as the
+/// default mode would. Another slice's type that fails is only warned about:
+/// the default mode would never parse it here, and a client that selects it
+/// keeps the declaration's type, as the default mode does when it fails.
+static void captureAPINotesType(Sema &S, Decl *D, StringRef TypeString,
+                                VersionedInfoMetadata Metadata) {
+  if (TypeString.empty() || isAPINotedTypeUndeduced(D))
+    return;
+  std::optional<ParsedAPINotesType> Parsed = parseAPINotesType(
+      S, D, TypeString, /*Diagnose=*/Metadata.IsProducerSelected);
+  if (!Parsed) {
+    if (!Metadata.IsProducerSelected && S.ParseTypeFromStringCallback)
+      S.Diag(D->getLocation(), diag::warn_apinotes_unselected_type_ignored)
+          << TypeString << !Metadata.Version.empty()
+          << Metadata.Version.getAsString();
+    return;
+  }
+  TypeSourceInfo *Adjusted =
+      Parsed->Type == Parsed->TypeInfo->getType()
+          ? Parsed->TypeInfo
+          : S.Context.getTrivialTypeSourceInfo(Parsed->Type, D->getLocation());
+  auto *TypeAttr = SwiftTypeAttr::CreateImplicit(S.Context, TypeString,
+                                                 Parsed->TypeInfo, Adjusted);
+  D->addAttr(SwiftVersionedAdditionAttr::CreateImplicit(
+      S.Context, Metadata.Version, TypeAttr, Metadata.IsReplacement,
+      Metadata.SliceGroup));
+}
+
 static void applyAPINotesType(Sema &S, Decl *decl, StringRef typeString,
                               VersionedInfoMetadata metadata) {
   if (typeString.empty())
-
     return;
 
   // Version-independent APINotes add "type" annotations
   // with a versioned attribute for the client to select and apply.
   if (S.captureSwiftVersionIndependentAPINotes()) {
-    auto *typeAttr = SwiftTypeAttr::CreateImplicit(S.Context, typeString);
-    auto *versioned = SwiftVersionedAdditionAttr::CreateImplicit(
-        S.Context, metadata.Version, typeAttr, metadata.IsReplacement,
-        metadata.SliceGroup);
-    decl->addAttr(versioned);
+    captureAPINotesType(S, decl, typeString, metadata);
   } else {
     if (!metadata.IsActive)
       return;
     S.ApplyAPINotesType(decl, typeString);
   }
+}
+
+static NullabilityKind getNullabilityKind(const SwiftNullabilityAttr *A) {
+  switch (A->getKind()) {
+  case SwiftNullabilityAttr::Kind::NonNull:
+    return NullabilityKind::NonNull;
+  case SwiftNullabilityAttr::Kind::Nullable:
+    return NullabilityKind::Nullable;
+  case SwiftNullabilityAttr::Kind::Unspecified:
+    return NullabilityKind::Unspecified;
+  case SwiftNullabilityAttr::Kind::NullableResult:
+    return NullabilityKind::NullableResult;
+  }
+  llvm_unreachable("unknown nullability");
 }
 
 /// Apply nullability to the given declaration.
@@ -130,6 +195,8 @@ static void applyNullability(Sema &S, Decl *decl, NullabilityKind nullability,
   // Version-independent APINotes add "nullability" annotations
   // with a versioned attribute for the client to select and apply.
   if (S.captureSwiftVersionIndependentAPINotes()) {
+    if (isAPINotedTypeUndeduced(decl))
+      return;
     SwiftNullabilityAttr::Kind attrNullabilityKind;
     switch (nullability) {
     case NullabilityKind::NonNull:
@@ -446,11 +513,13 @@ static void ProcessAPINotes(Sema &S, Decl *D,
 /// This is a very weak form of ABI check.
 static bool checkAPINotesReplacementType(Sema &S, SourceLocation Loc,
                                          QualType OrigType,
-                                         QualType ReplacementType) {
+                                         QualType ReplacementType,
+                                         bool Diagnose = true) {
   if (S.Context.getTypeSize(OrigType) !=
       S.Context.getTypeSize(ReplacementType)) {
-    S.Diag(Loc, diag::err_incompatible_replacement_type)
-        << ReplacementType << OrigType;
+    if (Diagnose)
+      S.Diag(Loc, diag::err_incompatible_replacement_type)
+          << ReplacementType << OrigType;
     return true;
   }
 
@@ -495,12 +564,33 @@ static void applyTypeToDecl(ASTContext &Ctx, Decl *D, QualType Type,
   }
 }
 
+/// Parse \p TypeString as the type API notes give \p D.
+///
+/// \param Diagnose Whether a failure is an error. If not, the parse is silent,
+/// and any error it would have reported makes it fail, recovery or not.
 static std::optional<ParsedAPINotesType>
-parseAPINotesType(Sema &S, Decl *D, StringRef TypeString) {
+parseAPINotesType(Sema &S, Decl *D, StringRef TypeString, bool Diagnose) {
   if (TypeString.empty() || !S.ParseTypeFromStringCallback)
     return std::nullopt;
-  auto ParsedType = S.ParseTypeFromStringCallback(TypeString, "<API Notes>",
-                                                  D->getLocation());
+  TypeResult ParsedType;
+  if (Diagnose) {
+    ParsedType = S.ParseTypeFromStringCallback(TypeString, "<API Notes>",
+                                               D->getLocation());
+  } else {
+    // The parser reports through the DiagnosticsEngine directly, so a
+    // SFINAETrap would not catch its errors. An error trap still counts the
+    // suppressed ones.
+    DiagnosticsEngine &Diags = S.getDiagnostics();
+    DiagnosticErrorTrap Trap(Diags);
+    llvm::SaveAndRestore NoTypoCorrection(S.DisableTypoCorrection, true);
+    const bool WasSuppressed = Diags.getSuppressAllDiagnostics();
+    Diags.setSuppressAllDiagnostics(true);
+    ParsedType = S.ParseTypeFromStringCallback(TypeString, "<API Notes>",
+                                               D->getLocation());
+    Diags.setSuppressAllDiagnostics(WasSuppressed);
+    if (Trap.hasErrorOccurred())
+      return std::nullopt;
+  }
   if (!ParsedType.isUsable())
     return std::nullopt;
   QualType Type = Sema::GetTypeFromParser(ParsedType.get());
@@ -525,7 +615,8 @@ parseAPINotesType(Sema &S, Decl *D, StringRef TypeString) {
   } else {
     llvm_unreachable("API notes allowed a type on an unknown declaration");
   }
-  if (checkAPINotesReplacementType(S, D->getLocation(), OrigType, Type))
+  if (checkAPINotesReplacementType(S, D->getLocation(), OrigType, Type,
+                                   Diagnose))
     return std::nullopt;
   return ParsedAPINotesType{Type, TypeInfo};
 }
@@ -715,9 +806,12 @@ static void ProcessAPINotes(Sema &S, FunctionOrMethod AnyFunc,
   if (!Info.SwiftReturnOwnership.empty())
     addSwiftAttrIfAbsent(S, D, "returns_" + Info.SwiftReturnOwnership);
 
-  // Result type override.
+  // Result type override. Capture parses every slice's, for whoever applies
+  // it later. A function's type is rebuilt once, below.
   std::optional<QualType> OverriddenResultType;
-  if (Metadata.IsActive) {
+  if (S.captureSwiftVersionIndependentAPINotes()) {
+    captureAPINotesType(S, D, Info.ResultType, Metadata);
+  } else if (Metadata.IsActive) {
     if (auto Parsed = parseAPINotesType(S, D, Info.ResultType)) {
       if (MD) {
         applyTypeToDecl(S.Context, MD, Parsed->Type, Parsed->TypeInfo);
@@ -1027,6 +1121,7 @@ static void ProcessVersionedAPINotes(
     std::tie(Version, InfoSlice) = Info[i];
     auto Active = (i == Selected) ? IsActive_t::Active : IsActive_t::Inactive;
     auto Replacement = IsSubstitution_t::Original;
+    const bool ProducerSelected = i == Selected;
 
     // When collecting all APINotes as version-independent,
     // capture all as inactive and defer to the client to select the
@@ -1053,9 +1148,9 @@ static void ProcessVersionedAPINotes(
       Version = Info[Selected].first;
     }
 
-    ProcessAPINotes(
-        S, D, InfoSlice,
-        VersionedInfoMetadata(Version, SliceGroup, Active, Replacement));
+    ProcessAPINotes(S, D, InfoSlice,
+                    VersionedInfoMetadata(Version, SliceGroup, Active,
+                                          Replacement, ProducerSelected));
   }
 
   if (S.captureSwiftVersionIndependentAPINotes())
@@ -1664,9 +1759,11 @@ static bool isCapturedSwiftName(const Attr *A, unsigned Group,
 
 /// Whether Sema infers attributes of kind \p Kind only once API notes have
 /// applied: ns_returns_retained for a method of an ARC method family, and
-/// cf_audited_transfer inside an audited region.
+/// ns_consumes_self for an init method, both of which depend on the return
+/// type, and cf_audited_transfer inside an audited region.
 static bool isAPINotesInferredKind(attr::Kind Kind) {
-  return Kind == attr::NSReturnsRetained || Kind == attr::CFAuditedTransfer;
+  return Kind == attr::NSReturnsRetained || Kind == attr::NSConsumesSelf ||
+         Kind == attr::CFAuditedTransfer;
 }
 
 /// Whether \p Attrs suppress Sema's inference of an attribute of kind \p Kind,
@@ -1681,6 +1778,9 @@ static bool suppressesInference(RangeT &&Attrs, attr::Kind Kind, bool IsInit) {
   assert(isAPINotesInferredKind(Kind) && "not inferred after API notes");
   if (Kind == attr::CFAuditedTransfer)
     return Has({attr::CFAuditedTransfer, attr::CFUnknownTransfer});
+  // Nothing suppresses ns_consumes_self, not even a second copy.
+  if (Kind == attr::NSConsumesSelf)
+    return false;
   // An init method only avoids a second copy.
   if (IsInit)
     return Has({attr::NSReturnsRetained});
@@ -1691,6 +1791,27 @@ static bool suppressesInference(RangeT &&Attrs, attr::Kind Kind, bool IsInit) {
 static bool isInitMethod(const Decl *D) {
   const auto *Method = dyn_cast<ObjCMethodDecl>(D);
   return Method && Method->getMethodFamily() == OMF_init;
+}
+
+/// Whether Sema would consider inferring an attribute of kind \p Kind on \p D
+/// at all, attributes aside. A method's family decides that for the ARC
+/// conventions, and the family depends on the return type, which API notes
+/// can rewrite.
+static bool isAPINotesInferenceApplicable(const Decl *D, attr::Kind Kind) {
+  const auto *Method = dyn_cast<ObjCMethodDecl>(D);
+  if (!Method || Kind == attr::CFAuditedTransfer)
+    return true;
+  switch (Method->getMethodFamily()) {
+  case OMF_init:
+    return true;
+  case OMF_alloc:
+  case OMF_copy:
+  case OMF_mutableCopy:
+  case OMF_new:
+    return Kind == attr::NSReturnsRetained;
+  default:
+    return false;
+  }
 }
 
 /// Whether \p D's attributes suppress an inference Sema makes after API notes
@@ -1707,10 +1828,28 @@ static Attr *createInferredAttr(ASTContext &Ctx,
   assert(isAPINotesInferredKind(Kind) && "not inferred after API notes");
   if (Kind == attr::NSReturnsRetained)
     return NSReturnsRetainedAttr::CreateImplicit(Ctx);
+  if (Kind == attr::NSConsumesSelf)
+    return NSConsumesSelfAttr::CreateImplicit(Ctx);
   // Sema creates this one with the audited region's pragma, which the record
   // was created with too.
   return CFAuditedTransferAttr::CreateImplicit(Ctx, *Inference);
 }
+
+/// The type API notes rewrite on \p D: a method's return type, or its own.
+static QualType getAPINotedType(const Decl *D) {
+  if (const auto *Method = dyn_cast<ObjCMethodDecl>(D))
+    return Method->getReturnType();
+  if (const auto *Property = dyn_cast<ObjCPropertyDecl>(D))
+    return Property->getType();
+  return cast<ValueDecl>(D)->getType();
+}
+
+/// What replaying a declaration's slices did that the rest of its collapse
+/// depends on.
+struct ReplayResult {
+  /// For a parameter, whether the function's type follows its new type.
+  bool TypeFollows = false;
+};
 
 /// How replayCapturedSlices treats a declaration.
 struct ReplayOptions {
@@ -1718,6 +1857,60 @@ struct ReplayOptions {
   /// back. If not, a winner's attribute moves to D instead of being copied.
   bool KeepsCaptured = true;
 };
+
+/// Take off an ARC ownership Sema inferred for \p D, which its type as written
+/// lacks.
+static void dropInferredObjCLifetime(ASTContext &Ctx, DeclaratorDecl *D) {
+  const QualType T = D->getType();
+  Qualifiers Local = T.getLocalQualifiers();
+  if (!Local.hasObjCLifetime() || !D->getTypeSourceInfo() ||
+      D->getTypeSourceInfo()->getType().getObjCLifetime() !=
+          Qualifiers::OCL_None)
+    return;
+  Local.removeObjCLifetime();
+  D->setType(Ctx.getQualifiedType(T.getLocalUnqualifiedType(), Local));
+}
+
+/// Infer \p D's ARC ownership where it has none, as
+/// SemaObjC::inferObjCARCLifetime does.
+static void inferObjCLifetime(ASTContext &Ctx, ValueDecl *D) {
+  const QualType T = D->getType();
+  if (T.getObjCLifetime() == Qualifiers::OCL_None && T->isObjCLifetimeType())
+    D->setType(
+        Ctx.getLifetimeQualifiedType(T, T->getObjCARCImplicitLifetime()));
+}
+
+/// Apply the winning slice's 'Type:', 'ResultType:' or nullability to \p D,
+/// as ProcessAPINotes applies its own slices'.
+///
+/// \returns Whether \p D's type changed.
+static bool applyCapturedType(ASTContext &Ctx, Decl *D, const Attr *Payload) {
+  const auto *Type = dyn_cast<SwiftTypeAttr>(Payload);
+  const auto *Nullability = dyn_cast<SwiftNullabilityAttr>(Payload);
+  const QualType Before = getAPINotedType(D);
+
+  // Under ARC, Sema infers a variable's or field's ownership once API notes
+  // have applied. The producer inferred it for the type as written, so it
+  // comes off first, and is inferred again after.
+  const bool InfersOwnership = Ctx.getLangOpts().ObjCAutoRefCount &&
+                               isa<VarDecl, FieldDecl>(D) &&
+                               !isa<ParmVarDecl>(D);
+  if (InfersOwnership)
+    dropInferredObjCLifetime(Ctx, cast<DeclaratorDecl>(D));
+  if (Nullability)
+    applyNullabilityToDecl(Ctx, D, getNullabilityKind(Nullability));
+  else
+    applyTypeToDecl(Ctx, D, Type->getAdjustedType(), Type->getParsedTypeLoc());
+  if (InfersOwnership)
+    inferObjCLifetime(Ctx, cast<ValueDecl>(D));
+
+  const bool Changed =
+      Before.getAsOpaquePtr() != getAPINotedType(D).getAsOpaquePtr();
+  // A method's family depends on its return type.
+  if (auto *Method = dyn_cast<ObjCMethodDecl>(D); Method && Changed)
+    Method->resetMethodFamily();
+  return Changed;
+}
 
 /// Rebuild \p D's attribute list from the slices captured on it, as the
 /// default mode would have left it: a source attribute stays in place, a
@@ -1731,9 +1924,10 @@ struct ReplayOptions {
 /// than editing also leaves the captured attributes untouched when
 /// ReplayOptions::KeepsCaptured says to, so a producer that collapses to
 /// precompute something for its importers can put them back afterwards.
-static void replayCapturedSlices(ASTContext &Context, Decl *D,
-                                 const SelectedSlices &Selected,
-                                 ReplayOptions Options) {
+static ReplayResult replayCapturedSlices(ASTContext &Context, Decl *D,
+                                         const SelectedSlices &Selected,
+                                         ReplayOptions Options) {
+  ReplayResult Result;
   auto Take = [&](Attr *Payload) {
     return Options.KeepsCaptured ? Payload->clone(Context) : Payload;
   };
@@ -1755,10 +1949,11 @@ static void replayCapturedSlices(ASTContext &Context, Decl *D,
     // to, decide again now that they have.
     if (const auto *Inference = dyn_cast<SwiftVersionedInferenceAttr>(A)) {
       const attr::Kind Kind = Inference->getInferredKind();
-      const bool Suppressed = isAPINotesInferenceSuppressed(D, Kind);
-      if (!Inference->getInferred() && !Suppressed)
+      const bool Wanted = isAPINotesInferenceApplicable(D, Kind) &&
+                          !isAPINotesInferenceSuppressed(D, Kind);
+      if (!Inference->getInferred() && Wanted)
         Rebuilt.push_back(createInferredAttr(Context, Inference));
-      DropInferred = Inference->getInferred() && Suppressed;
+      DropInferred = Inference->getInferred() && !Wanted;
       continue;
     }
 
@@ -1794,6 +1989,15 @@ static void replayCapturedSlices(ASTContext &Context, Decl *D,
     auto Winner = Selected.find(Group);
     const bool IsWinner = Winner != Selected.end() && Version == Winner->second;
 
+    // A type is no attribute. The winner rewrites the declaration's type, and
+    // every other slice leaves nothing, as in the default mode.
+    if (isa_and_nonnull<SwiftTypeAttr, SwiftNullabilityAttr>(Payload)) {
+      if (!IsWinner)
+        continue;
+      Result.TypeFollows |= applyCapturedType(Context, D, Payload);
+      continue;
+    }
+
     // ProcessAPINotes skips an UnsafeBufferUsage slice, winner or not, once
     // the attribute is live, as it is when a slice applied before won.
     if (isa_and_nonnull<UnsafeBufferUsageAttr>(Payload) &&
@@ -1819,13 +2023,15 @@ static void replayCapturedSlices(ASTContext &Context, Decl *D,
     const VersionedInfoMetadata Metadata(
         Winner->second, Group,
         IsWinner ? IsActive_t::Active : IsActive_t::Inactive,
-        IsWinner ? IsSubstitution_t::Original : IsSubstitution_t::Replacement);
+        IsWinner ? IsSubstitution_t::Original : IsSubstitution_t::Replacement,
+        /*ProducerSelected=*/false);
     handleAPINotedAttributeImpl(Context, D, /*IsAddition=*/Payload != nullptr,
                                 Metadata, Kind, [&] { return Take(Payload); });
   }
 
   if (Rebuilt.empty())
     D->dropAttrs();
+  return Result;
 }
 
 bool Sema::captureSwiftVersionIndependentAPINotes() {
@@ -1836,24 +2042,37 @@ bool Sema::captureSwiftVersionIndependentAPINotes() {
 void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
                                      VersionTuple Requested,
                                      APINotesCollapseUndo *Undo) {
-  // A parameter collapses with its function.
+  // A parameter collapses with its function, which builds its type from the
+  // parameters' types.
   if (!D || isa<ParmVarDecl>(D))
     return;
+  auto *FD = dyn_cast<FunctionDecl>(D);
 
   // Only a capture-mode declaration carries slice markers. The default mode
   // also leaves addition wrappers behind, for the slices that lost, and
   // re-selecting over those would corrupt an already-applied declaration.
-  auto Replay = [&](Decl *D) {
+  auto Replay = [&](Decl *D) -> ReplayResult {
     if (!D->hasAttr<SwiftVersionedSliceAttr>())
-      return;
+      return ReplayResult();
     if (Undo)
       Undo->save(D);
-    replayCapturedSlices(Context, D, selectCapturedSlices(D, Requested),
-                         ReplayOptions{/*KeepsCaptured=*/Undo != nullptr});
+    return replayCapturedSlices(
+        Context, D, selectCapturedSlices(D, Requested),
+        ReplayOptions{/*KeepsCaptured=*/Undo != nullptr});
   };
+  const bool Replayed = D->hasAttr<SwiftVersionedSliceAttr>();
   Replay(D);
+
+  // ProcessAPINotes rebuilds a function's type whenever it changes a
+  // parameter's.
+  bool TypeChanges = false;
   for (ParmVarDecl *Param : getAPINotedParams(D))
-    Replay(Param);
+    TypeChanges |= Replay(Param).TypeFollows;
+  if (FD && TypeChanges) {
+    if (Undo && !Replayed)
+      Undo->save(FD);
+    rebuildFunctionType(Context, FD, std::nullopt);
+  }
 }
 
 void APINotesCollapseUndo::save(Decl *D) {
@@ -1861,6 +2080,22 @@ void APINotesCollapseUndo::save(Decl *D) {
   S.D = D;
   if (D->hasAttrs())
     S.Attrs = D->getAttrs();
+  if (auto *Method = dyn_cast<ObjCMethodDecl>(D)) {
+    S.Type = Method->getReturnType();
+    S.TypeInfo = Method->getReturnTypeSourceInfo();
+    S.Qualifiers = Method->getObjCDeclQualifier();
+  } else if (auto *Property = dyn_cast<ObjCPropertyDecl>(D)) {
+    S.Type = Property->getType();
+    S.TypeInfo = Property->getTypeSourceInfo();
+    S.Qualifiers = Property->getPropertyAttributes();
+  } else if (auto *Declarator = dyn_cast<DeclaratorDecl>(D)) {
+    S.Type = Declarator->getType();
+    S.TypeInfo = Declarator->getTypeSourceInfo();
+    // Only an Objective-C method's parameter has qualifiers to set.
+    if (auto *Param = dyn_cast<ParmVarDecl>(D);
+        Param && Param->isObjCMethodParameter())
+      S.Qualifiers = Param->getObjCDeclQualifier();
+  }
   Decls.push_back(std::move(S));
 }
 
@@ -1873,13 +2108,63 @@ void APINotesCollapseUndo::restore() {
       D->getAttrs() = std::move(*S.Attrs);
     else
       D->setAttrs(*S.Attrs);
+    if (auto *Method = dyn_cast<ObjCMethodDecl>(D)) {
+      Method->setReturnType(S.Type);
+      Method->setReturnTypeSourceInfo(S.TypeInfo);
+      Method->setObjCDeclQualifier(Decl::ObjCDeclQualifier(S.Qualifiers));
+      Method->resetMethodFamily();
+    } else if (auto *Property = dyn_cast<ObjCPropertyDecl>(D)) {
+      Property->setType(S.Type, S.TypeInfo);
+      Property->overwritePropertyAttributes(S.Qualifiers);
+    } else if (auto *Declarator = dyn_cast<DeclaratorDecl>(D)) {
+      Declarator->setType(S.Type);
+      Declarator->setTypeSourceInfo(S.TypeInfo);
+      if (auto *Param = dyn_cast<ParmVarDecl>(D);
+          Param && Param->isObjCMethodParameter())
+        Param->setObjCDeclQualifier(Decl::ObjCDeclQualifier(S.Qualifiers));
+    }
   }
   Decls.clear();
 }
 
+bool clang::instantiateCapturedAPINotesType(
+    Sema &S, const MultiLevelTemplateArgumentList &TemplateArgs, const Attr *A,
+    Decl *New) {
+  const auto *Addition = dyn_cast<SwiftVersionedAdditionAttr>(A);
+  const Attr *Payload = Addition ? Addition->getAdditionalAttr() : nullptr;
+  if (!isa_and_nonnull<SwiftTypeAttr, SwiftNullabilityAttr>(Payload))
+    return false;
+
+  // An instantiation takes its types from the pattern's types as written.
+  // Nullability, and a function's 'ResultType:', replace only the pattern's
+  // types, so they don't reach it; any other 'Type:' replaces those as
+  // written too, so the instantiation takes it substituted.
+  const auto *Type = dyn_cast<SwiftTypeAttr>(Payload);
+  if (!Type || isa<FunctionDecl>(New))
+    return true;
+  auto Substitute = [&](TypeSourceInfo *TypeInfo) {
+    return S.SubstType(TypeInfo, TemplateArgs, New->getLocation(),
+                       cast<NamedDecl>(New)->getDeclName());
+  };
+  TypeSourceInfo *Parsed = Substitute(Type->getParsedTypeLoc());
+  TypeSourceInfo *Adjusted =
+      Type->getAdjustedTypeLoc() == Type->getParsedTypeLoc()
+          ? Parsed
+          : Substitute(Type->getAdjustedTypeLoc());
+  if (!Parsed || !Adjusted)
+    return true;
+  New->addAttr(SwiftVersionedAdditionAttr::CreateImplicit(
+      S.Context, Addition->getVersion(),
+      SwiftTypeAttr::CreateImplicit(S.Context, Type->getTypeString(), Parsed,
+                                    Adjusted),
+      Addition->getIsReplacedByActive(), Addition->getSliceGroup()));
+  return true;
+}
+
 bool clang::inferAfterAPINotes(Sema &S, Decl *D, attr::Kind Kind,
+                               bool Applicable,
                                const AttributeCommonInfo *Info) {
-  const bool Inferred = !isAPINotesInferenceSuppressed(D, Kind);
+  const bool Inferred = Applicable && !isAPINotesInferenceSuppressed(D, Kind);
   if (S.captureSwiftVersionIndependentAPINotes() &&
       D->hasAttr<SwiftVersionedSliceAttr>())
     D->addAttr(Info ? SwiftVersionedInferenceAttr::CreateImplicit(

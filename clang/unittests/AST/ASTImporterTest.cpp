@@ -8198,6 +8198,44 @@ TEST_P(ImportAttributes, ImportAligned) {
   EXPECT_TRUE(ToA);
 }
 
+// A 'Type:' that -fswift-version-independent-apinotes captures carries the
+// types it parsed, which have to move to the destination context with it.
+TEST_P(ImportAttributes, ImportSwiftTypeInVersionedAddition) {
+  Decl *FromTU =
+      getTuDecl("struct Payload; struct Payload *p; void *test;", Lang_C99);
+  auto *FromD =
+      FirstDeclMatcher<VarDecl>().match(FromTU, varDecl(hasName("test")));
+  auto *FromP =
+      FirstDeclMatcher<VarDecl>().match(FromTU, varDecl(hasName("p")));
+  ASTContext &FromCtx = FromTU->getASTContext();
+  TypeSourceInfo *FromTSI = FromCtx.getTrivialTypeSourceInfo(FromP->getType());
+  FromD->addAttr(SwiftVersionedAdditionAttr::CreateImplicit(
+      FromCtx, VersionTuple(4),
+      SwiftTypeAttr::CreateImplicit(FromCtx, "struct Payload *", FromTSI,
+                                    FromTSI),
+      /*IsReplacedByActive=*/false, /*SliceGroup=*/0));
+
+  auto *ToD = Import(FromD, Lang_C99);
+  ASSERT_TRUE(ToD);
+  const auto *ToAddition = ToD->getAttr<SwiftVersionedAdditionAttr>();
+  ASSERT_TRUE(ToAddition);
+  const auto *ToType = dyn_cast<SwiftTypeAttr>(ToAddition->getAdditionalAttr());
+  ASSERT_TRUE(ToType);
+  EXPECT_EQ(ToType->getTypeString(), "struct Payload *");
+
+  const TranslationUnitDecl *ToTU =
+      ToAST->getASTContext().getTranslationUnitDecl();
+  for (const TypeSourceInfo *ToTSI :
+       {ToType->getParsedTypeLoc(), ToType->getAdjustedTypeLoc()}) {
+    ASSERT_TRUE(ToTSI);
+    EXPECT_NE(ToTSI, FromTSI);
+    const RecordDecl *ToPayload =
+        ToTSI->getType()->getPointeeType()->getAsRecordDecl();
+    ASSERT_TRUE(ToPayload);
+    EXPECT_EQ(ToPayload->getTranslationUnitDecl(), ToTU);
+  }
+}
+
 TEST_P(ImportAttributes, ImportAlignValue) {
   AlignValueAttr *FromAttr, *ToAttr;
   importAttr<VarDecl>(

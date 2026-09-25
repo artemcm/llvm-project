@@ -426,6 +426,13 @@ public:
   /// Determines the family of this method.
   ObjCMethodFamily getMethodFamily() const;
 
+  /// Forget the family getMethodFamily() cached, which depends on the return
+  /// type, for after the return type changes.
+  void resetMethodFamily() {
+    ObjCMethodDeclBits.Family =
+        static_cast<ObjCMethodFamily>(InvalidObjCMethodFamily);
+  }
+
   bool isInstanceMethod() const { return ObjCMethodDeclBits.IsInstance; }
   void setInstanceMethod(bool isInst) {
     ObjCMethodDeclBits.IsInstance = isInst;

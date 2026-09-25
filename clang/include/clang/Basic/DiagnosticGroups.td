@@ -866,6 +866,9 @@ def ModulesDriver : DiagGroup<"modules-driver">;
 def RoundTripCC1Args : DiagGroup<"round-trip-cc1-args">;
 def NewlineEOF : DiagGroup<"newline-eof">;
 def Nullability : DiagGroup<"nullability">;
+// API notes that -fswift-version-independent-apinotes captures but cannot
+// reproduce exactly for a client that selects them.
+def APINotesVersionIndependent : DiagGroup<"apinotes-version-independent">;
 def NullabilityDeclSpec : DiagGroup<"nullability-declspec">;
 def NullabilityInferredOnNestedType : DiagGroup<"nullability-inferred-on-nested-type">;
 def NullableToNonNullConversion : DiagGroup<"nullable-to-nonnull-conversion">;

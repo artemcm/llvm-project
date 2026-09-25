@@ -10,6 +10,7 @@
 #define LLVM_CLANG_LIB_SEMA_SEMAAPINOTESINTERNAL_H
 
 #include "clang/APINotes/Types.h"
+#include "clang/AST/Attr.h"
 #include "clang/Basic/AttrKinds.h"
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -22,6 +23,8 @@
 
 namespace clang {
 class Decl;
+class MultiLevelTemplateArgumentList;
+class ParmVarDecl;
 class Sema;
 struct APINotesParameterSelectorCandidates;
 namespace api_notes {
@@ -101,11 +104,26 @@ struct APINotesSelectorDiagnosticState {
 /// the collapse makes again once it has applied the slices. Call it just
 /// before adding the inferred attribute.
 ///
+/// \param Applicable Whether D's type as written lets Sema infer it at all.
+/// Pass false, under capture, to record an inference that D's type as written
+/// rules out but a captured type could make applicable: a method whose family
+/// its captured 'ResultType:' decides.
 /// \param Info What the inferred attribute is created with, if not a bare
 /// implicit attribute: a pragma's name, location and form. The record keeps
 /// it, for the collapse to infer the attribute again the same way.
 bool inferAfterAPINotes(Sema &S, Decl *D, attr::Kind Kind,
+                        bool Applicable = true,
                         const AttributeCommonInfo *Info = nullptr);
+
+/// Instantiate \p A, if it is an API notes slice of a type or nullability
+/// captured on a template pattern, onto the pattern's instantiation \p New, as
+/// the default mode's instantiation would take what it stands for.
+///
+/// \returns Whether \p A was such a slice. Anything else instantiates as
+/// usual.
+bool instantiateCapturedAPINotesType(
+    Sema &S, const MultiLevelTemplateArgumentList &TemplateArgs, const Attr *A,
+    Decl *New);
 
 } // namespace clang
 

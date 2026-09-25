@@ -1453,7 +1453,8 @@ void SemaObjC::AddCFAuditedAttribute(Decl *D) {
                            AttributeCommonInfo::Form::Pragma());
 
   // Don't add a redundant or conflicting attribute.
-  if (!inferAfterAPINotes(SemaRef, D, attr::CFAuditedTransfer, &Info))
+  if (!inferAfterAPINotes(SemaRef, D, attr::CFAuditedTransfer,
+                          /*Applicable=*/true, &Info))
     return;
 
   D->addAttr(CFAuditedTransferAttr::CreateImplicit(Context, Info));

@@ -9870,6 +9870,14 @@ Expected<Attr *> ASTImporter::Import(const Attr *FromAttr) {
                   From->getIsReplacedByActive(), From->getSliceGroup());
     break;
   }
+  case attr::SwiftType: {
+    // A captured 'Type:' or 'ResultType:' carries its parsed types.
+    const auto *From = cast<SwiftTypeAttr>(FromAttr);
+    AI.importAttr(From, From->getTypeString(),
+                  AI.importArg(From->getParsedTypeLoc()).value(),
+                  AI.importArg(From->getAdjustedTypeLoc()).value());
+    break;
+  }
   default: {
     // The default branch works for attributes that have no arguments to import.
     // FIXME: Handle every attribute type that has arguments of type to import

@@ -33,6 +33,65 @@
 
 using namespace clang;
 
+/// Whether \p resultType, an Objective-C object pointer, is a valid result
+/// type for \p method, which is in the 'init' family.
+///
+/// \param receiverTypeIfCall - if null, check this as if declaring it;
+///   if non-null, check this as if making a call to it with the given
+///   receiver type
+static bool isValidInitResultType(const ObjCMethodDecl *method,
+                                  QualType resultType,
+                                  QualType receiverTypeIfCall) {
+  // We ignore protocols here.  Should we?  What about Class?
+
+  const ObjCObjectType *result =
+      resultType->castAs<ObjCObjectPointerType>()->getObjectType();
+
+  if (result->isObjCId()) {
+    return true;
+  } else if (result->isObjCClass()) {
+    // fall through: always an error
+  } else {
+    ObjCInterfaceDecl *resultClass = result->getInterface();
+    assert(resultClass && "unexpected object type!");
+
+    // It's okay for the result type to still be a forward declaration
+    // if we're checking an interface declaration.
+    if (!resultClass->hasDefinition()) {
+      if (receiverTypeIfCall.isNull() &&
+          !isa<ObjCImplementationDecl>(method->getDeclContext()))
+        return true;
+
+    // Otherwise, we try to compare class types.
+    } else {
+      // If this method was declared in a protocol, we can't check
+      // anything unless we have a receiver type that's an interface.
+      const ObjCInterfaceDecl *receiverClass = nullptr;
+      if (isa<ObjCProtocolDecl>(method->getDeclContext())) {
+        if (receiverTypeIfCall.isNull())
+          return true;
+
+        receiverClass = receiverTypeIfCall->castAs<ObjCObjectPointerType>()
+          ->getInterfaceDecl();
+
+        // This can be null for calls to e.g. id<Foo>.
+        if (!receiverClass)
+          return true;
+      } else {
+        receiverClass = method->getClassInterface();
+        assert(receiverClass && "method not associated with a class!");
+      }
+
+      // If either class is a subclass of the other, it's fine.
+      if (receiverClass->isSuperClassOf(resultClass) ||
+          resultClass->isSuperClassOf(receiverClass))
+        return true;
+    }
+  }
+
+  return false;
+}
+
 /// Check whether the given method, which must be in the 'init'
 /// family, is a valid member of that family.
 ///
@@ -45,57 +104,15 @@ using namespace clang;
 bool SemaObjC::checkInitMethod(ObjCMethodDecl *method,
                                QualType receiverTypeIfCall) {
   ASTContext &Context = getASTContext();
-  if (method->isInvalidDecl()) return true;
+  if (method->isInvalidDecl())
+    return true;
 
   // This castAs is safe: methods that don't return an object
   // pointer won't be inferred as inits and will reject an explicit
   // objc_method_family(init).
-
-  // We ignore protocols here.  Should we?  What about Class?
-
-  const ObjCObjectType *result =
-      method->getReturnType()->castAs<ObjCObjectPointerType>()->getObjectType();
-
-  if (result->isObjCId()) {
+  if (isValidInitResultType(method, method->getReturnType(),
+                            receiverTypeIfCall))
     return false;
-  } else if (result->isObjCClass()) {
-    // fall through: always an error
-  } else {
-    ObjCInterfaceDecl *resultClass = result->getInterface();
-    assert(resultClass && "unexpected object type!");
-
-    // It's okay for the result type to still be a forward declaration
-    // if we're checking an interface declaration.
-    if (!resultClass->hasDefinition()) {
-      if (receiverTypeIfCall.isNull() &&
-          !isa<ObjCImplementationDecl>(method->getDeclContext()))
-        return false;
-
-    // Otherwise, we try to compare class types.
-    } else {
-      // If this method was declared in a protocol, we can't check
-      // anything unless we have a receiver type that's an interface.
-      const ObjCInterfaceDecl *receiverClass = nullptr;
-      if (isa<ObjCProtocolDecl>(method->getDeclContext())) {
-        if (receiverTypeIfCall.isNull())
-          return false;
-
-        receiverClass = receiverTypeIfCall->castAs<ObjCObjectPointerType>()
-          ->getInterfaceDecl();
-
-        // This can be null for calls to e.g. id<Foo>.
-        if (!receiverClass) return false;
-      } else {
-        receiverClass = method->getClassInterface();
-        assert(receiverClass && "method not associated with a class!");
-      }
-
-      // If either class is a subclass of the other, it's fine.
-      if (receiverClass->isSuperClassOf(resultClass) ||
-          resultClass->isSuperClassOf(receiverClass))
-        return false;
-    }
-  }
 
   SourceLocation loc = method->getLocation();
 
@@ -226,11 +243,89 @@ void SemaObjC::CheckObjCMethodOverride(ObjCMethodDecl *NewMethod,
   }
 }
 
+/// The ARC family that \p method's selector gives it once its return type is
+/// an Objective-C object pointer: init, alloc, copy, mutableCopy or new. Null
+/// for any other, or for a family the method states explicitly.
+static std::optional<ObjCMethodFamily>
+getSelectorARCFamily(const ObjCMethodDecl *method) {
+  if (method->hasAttr<ObjCMethodFamilyAttr>())
+    return std::nullopt;
+  switch (ObjCMethodFamily family = method->getSelector().getMethodFamily()) {
+  case OMF_init:
+    if (!method->isInstanceMethod())
+      return std::nullopt;
+    return family;
+  case OMF_alloc:
+  case OMF_copy:
+  case OMF_mutableCopy:
+  case OMF_new:
+    return family;
+  default:
+    return std::nullopt;
+  }
+}
+
+/// A 'ResultType:' slice captured on a method, under
+/// -fswift-version-independent-apinotes.
+struct CapturedResultType {
+  VersionTuple Version;
+  QualType Type;
+};
+
+static SmallVector<CapturedResultType, 2>
+getCapturedResultTypes(const ObjCMethodDecl *method) {
+  SmallVector<CapturedResultType, 2> Types;
+  for (const auto *Addition :
+       method->specific_attrs<SwiftVersionedAdditionAttr>())
+    if (const auto *Type =
+            dyn_cast<SwiftTypeAttr>(Addition->getAdditionalAttr()))
+      Types.push_back({Addition->getVersion(), Type->getAdjustedType()});
+  return Types;
+}
+
+/// Warn about each captured result type that would make \p method, an init
+/// method by its selector, an invalid member of the family. The default mode
+/// rejects such a method for a client that selects it, and the collapse,
+/// which has no Sema, cannot.
+static void
+diagnoseCapturedInitResultTypes(SemaObjC &S, const ObjCMethodDecl *method,
+                                ArrayRef<CapturedResultType> Types) {
+  for (const CapturedResultType &Captured : Types)
+    if (Captured.Type->isObjCObjectPointerType() &&
+        !isValidInitResultType(method, Captured.Type, QualType()))
+      S.Diag(method->getLocation(),
+             diag::warn_apinotes_captured_init_unrelated_result)
+          << Captured.Type << !Captured.Version.empty()
+          << Captured.Version.getAsString();
+}
+
 /// Check a method declaration for compatibility with the Objective-C
 /// ARC conventions.
 bool SemaObjC::CheckARCMethodDecl(ObjCMethodDecl *method) {
   ASTContext &Context = getASTContext();
   ObjCMethodFamily family = method->getMethodFamily();
+
+  // Under -fswift-version-independent-apinotes no 'ResultType:' applies here,
+  // so the family is the type as written's. A captured one can give the
+  // method a family the type as written does not, or take it away. The
+  // collapse decides the family again once it has applied the winner, so
+  // where one could, the inferences that depend on it are recorded.
+  std::optional<ObjCMethodFamily> selectorFamily;
+  SmallVector<CapturedResultType, 2> capturedTypes;
+  if (SemaRef.captureSwiftVersionIndependentAPINotes())
+    if ((selectorFamily = getSelectorARCFamily(method)))
+      capturedTypes = getCapturedResultTypes(method);
+  if (family == OMF_None && !capturedTypes.empty()) {
+    if (*selectorFamily == OMF_init) {
+      diagnoseCapturedInitResultTypes(*this, method, capturedTypes);
+      inferAfterAPINotes(SemaRef, method, attr::NSConsumesSelf,
+                         /*Applicable=*/false);
+    }
+    inferAfterAPINotes(SemaRef, method, attr::NSReturnsRetained,
+                       /*Applicable=*/false);
+    return false;
+  }
+
   switch (family) {
   case OMF_None:
   case OMF_finalize:
@@ -262,8 +357,10 @@ bool SemaObjC::CheckARCMethodDecl(ObjCMethodDecl *method) {
     // If the method doesn't obey the init rules, don't bother annotating it.
     if (checkInitMethod(method, QualType()))
       return true;
+    diagnoseCapturedInitResultTypes(*this, method, capturedTypes);
 
-    method->addAttr(NSConsumesSelfAttr::CreateImplicit(Context));
+    if (inferAfterAPINotes(SemaRef, method, attr::NSConsumesSelf))
+      method->addAttr(NSConsumesSelfAttr::CreateImplicit(Context));
 
     break;
 

@@ -12114,6 +12114,15 @@ let CategoryName = "API Notes Issue" in {
 
 def err_incompatible_replacement_type : Error<
   "API notes replacement type %0 has a different size from original type %1">;
+def warn_apinotes_unselected_type_ignored : Warning<
+  "API notes type '%0' for %select{unversioned notes|Swift version %2}1 is "
+  "not valid here; a client that selects it keeps the declaration's type">,
+  InGroup<APINotesVersionIndependent>;
+def warn_apinotes_captured_init_unrelated_result : Warning<
+  "API notes result type %0 for %select{unversioned notes|Swift version %2}1 "
+  "is unrelated to this init method's class; a client that selects it does "
+  "not reject the method">,
+  InGroup<APINotesVersionIndependent>;
 
 } // end of API Notes category
 

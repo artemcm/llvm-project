@@ -9,6 +9,7 @@
 //
 //===----------------------------------------------------------------------===/
 
+#include "SemaAPINotesInternal.h"
 #include "TreeTransform.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -887,6 +888,9 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
                             LocalInstantiationScope *OuterMostScope) {
   for (const auto *TmplAttr : Tmpl->attrs()) {
     if (!isRelevantAttr(*this, New, TmplAttr))
+      continue;
+
+    if (instantiateCapturedAPINotesType(*this, TemplateArgs, TmplAttr, New))
       continue;
 
     // FIXME: This should be generalized to more than just the AlignedAttr.
