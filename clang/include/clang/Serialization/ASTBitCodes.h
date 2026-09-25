@@ -371,6 +371,12 @@ enum ControlRecordTypes {
   /// Record code for the directories this AST file depends on the listing of.
   /// Only emitted when non-empty.
   MODULE_DIRECTORY_DEPENDENCIES,
+
+  /// Record code for the Swift version the AST file applied API notes at, and
+  /// the versions that select the same slices. Written only if some slice made
+  /// a difference. In the control block rather than the options block, so that
+  /// a file imported through another is checked too.
+  API_NOTES_SWIFT_VERSION,
 };
 
 /// Record types that occur within the options block inside

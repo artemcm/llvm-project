@@ -56,6 +56,11 @@ def warn_ast_file_config_mismatch
       DefaultError;
 def err_ast_file_langopt_value_mismatch : Error<
   "%0 differs in precompiled file '%1' vs. current file">;
+def warn_ast_file_apinotes_swift_version : Warning<
+  "%0 applied API notes for %select{Swift %2|no Swift version}1, but this "
+  "compilation %select{requests Swift %4|requests no Swift version|captures "
+  "API notes for every Swift version}3">,
+  InGroup<DiagGroup<"apinotes-swift-version-mismatch">>;
 def err_ast_file_codegenopt_mismatch : Error<"%0 was %select{disabled|enabled}1 in "
   "precompiled file '%3' but is currently %select{disabled|enabled}2">;
 def err_ast_file_codegenopt_value_mismatch
