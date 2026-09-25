@@ -15499,6 +15499,16 @@ public:
                                              bool AllowArrayTypes,
                                              bool OverrideExisting);
 
+  /// CheckImplicitNullabilityTypeSpecifier with \p OverrideExisting set: add
+  /// \p Nullability to \p Type, replacing any nullability specifier \p Type
+  /// carries locally. That path emits no diagnostics, so it needs no Sema, and
+  /// the collapse of captured API notes uses it too.
+  ///
+  /// \returns true if nullability cannot be applied, false otherwise.
+  static bool OverrideImplicitNullability(ASTContext &Context, QualType &Type,
+                                          NullabilityKind Nullability,
+                                          bool AllowArrayTypes);
+
   /// Check whether the given variable declaration has a size that fits within
   /// the address space it is declared in. This issues a diagnostic if not.
   ///
