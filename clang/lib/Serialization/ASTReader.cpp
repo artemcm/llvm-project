@@ -8669,6 +8669,14 @@ void ASTReader::collapseVersionedAPINotes(Decl *D) {
   // version it happened to be built at would be the one every importer sees.
   if (!ReadVersionedAPINotesSlice || !APINotesSwiftVersion)
     return;
+  // The collapse rebuilds a function's type from its parameters', and a
+  // deduced return type is read only after the function, so
+  // finishPendingActions collapses it once it has set it.
+  if (const auto *FD = dyn_cast<FunctionDecl>(D);
+      FD && FD->getDeclaredReturnType()->getContainedAutoType() &&
+      llvm::is_contained(llvm::make_first_range(PendingDeducedFunctionTypes),
+                         FD))
+    return;
   Sema::CollapseVersionedAPINotes(getContext(), D, *APINotesSwiftVersion);
 }
 
@@ -10714,7 +10722,15 @@ void ASTReader::finishPendingActions() {
         continue;
       }
     }
+    // The API notes collapse waited for these types, and runs once they are
+    // no longer pending.
+    SmallVector<FunctionDecl *, 4> DeducedFunctions;
+    if (ReadVersionedAPINotesSlice && APINotesSwiftVersion)
+      DeducedFunctions =
+          llvm::to_vector(llvm::make_first_range(PendingDeducedFunctionTypes));
     PendingDeducedFunctionTypes.clear();
+    for (FunctionDecl *FD : DeducedFunctions)
+      collapseVersionedAPINotes(FD);
 
     // Load each variable type that we deferred loading because it was a
     // deduced type that might refer to a local type declared within itself.
