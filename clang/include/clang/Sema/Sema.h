@@ -855,7 +855,7 @@ enum AttrName { Target, TargetClones, TargetVersion };
 void inferNoReturnAttr(Sema &S, Decl *D);
 
 /// What Sema::CollapseVersionedAPINotes replaced on the declarations it
-/// collapsed, their attribute lists, so it can be put back.
+/// collapsed, their attribute lists and their types, so it can be put back.
 class APINotesCollapseUndo {
 public:
   /// Record \p D's current state. Recording it twice is harmless: restore
@@ -869,6 +869,9 @@ private:
   struct Saved {
     Decl *D;
     std::optional<AttrVec> Attrs;
+    QualType Type;
+    TypeSourceInfo *TypeInfo = nullptr;
+    unsigned Qualifiers = 0;
   };
   SmallVector<Saved, 2> Decls;
 };
