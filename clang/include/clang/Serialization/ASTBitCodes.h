@@ -394,6 +394,10 @@ enum OptionsRecordTypes {
 
   /// Record code for the codegen options table.
   CODEGEN_OPTIONS,
+
+  /// Record code for the Swift version the AST file applied API notes at,
+  /// written only if they differed by Swift version.
+  API_NOTES_OPTIONS,
 };
 
 /// Record codes for the unhashed control block.

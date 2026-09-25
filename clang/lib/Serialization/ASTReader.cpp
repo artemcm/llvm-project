@@ -187,6 +187,12 @@ bool ChainedASTReaderListener::ReadCodeGenOptions(
                                     AllowCompatibleDifferences);
 }
 
+void ChainedASTReaderListener::ReadAPINotesSwiftVersion(
+    VersionTuple Version, StringRef ModuleFilename) {
+  First->ReadAPINotesSwiftVersion(Version, ModuleFilename);
+  Second->ReadAPINotesSwiftVersion(Version, ModuleFilename);
+}
+
 bool ChainedASTReaderListener::ReadTargetOptions(
     const TargetOptions &TargetOpts, StringRef ModuleFilename, bool Complain,
     bool AllowCompatibleDifferences) {
@@ -571,6 +577,21 @@ bool PCHValidator::ReadCodeGenOptions(const CodeGenOptions &CGOpts,
   return checkCodegenOptions(ExistingCGOpts, CGOpts, ModuleFilename,
                              Complain ? &Reader.Diags : nullptr,
                              AllowCompatibleDifferences);
+}
+
+void PCHValidator::ReadAPINotesSwiftVersion(VersionTuple Version,
+                                            StringRef ModuleFilename) {
+  // The file shows every importer its declarations as that version sees them.
+  // That is only right for an importer at that version: not for one at
+  // another, and not for one that captures API notes for every version. It
+  // does not make the file unusable, so this warns whether or not the caller
+  // tolerates a configuration mismatch.
+  const std::optional<VersionTuple> &Requested = Reader.APINotesSwiftVersion;
+  if (Requested == Version)
+    return;
+  Reader.Diag(diag::warn_ast_file_apinotes_swift_version)
+      << ModuleFilename << Version.getAsString() << !Requested
+      << (Requested ? Requested->getAsString() : std::string());
 }
 
 bool PCHValidator::ReadTargetOptions(const TargetOptions &TargetOpts,
@@ -3156,6 +3177,13 @@ ASTReader::ASTReadResult ASTReader::ReadOptionsBlock(
       if (ParseCodeGenOptions(Record, Filename, Complain, Listener,
                               AllowCompatibleConfigurationMismatch))
         Result = ConfigurationMismatch;
+      break;
+    }
+
+    case API_NOTES_OPTIONS: {
+      unsigned Idx = 0;
+      Listener.ReadAPINotesSwiftVersion(ReadVersionTuple(Record, Idx),
+                                        Filename);
       break;
     }
 

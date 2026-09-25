@@ -58,6 +58,9 @@ class APINotesManager {
   /// The Swift version to use when interpreting versioned API notes.
   llvm::VersionTuple SwiftVersion;
 
+  /// See noteAppliedVersionedAPINotes.
+  bool AppliedVersionedAPINotes = false;
+
   enum ReaderKind : unsigned { Public = 0, Private = 1 };
 
   /// API notes readers for the current module.
@@ -127,6 +130,16 @@ public:
   void setSwiftVersion(llvm::VersionTuple Version) {
     this->SwiftVersion = Version;
   }
+
+  /// The Swift version to use when filtering API notes.
+  llvm::VersionTuple getSwiftVersion() const { return SwiftVersion; }
+
+  /// Record that API notes were applied that differ by Swift version, so what
+  /// this compilation produces depends on the version it selected.
+  void noteAppliedVersionedAPINotes() { AppliedVersionedAPINotes = true; }
+
+  /// Whether API notes were applied that differ by Swift version.
+  bool appliedVersionedAPINotes() const { return AppliedVersionedAPINotes; }
 
   /// Load the API notes for the current module.
   ///

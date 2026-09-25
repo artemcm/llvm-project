@@ -906,6 +906,7 @@ void ASTWriter::WriteBlockInfoBlock() {
   BLOCK(OPTIONS_BLOCK);
   RECORD(LANGUAGE_OPTIONS);
   RECORD(CODEGEN_OPTIONS);
+  RECORD(API_NOTES_OPTIONS);
   RECORD(TARGET_OPTIONS);
   RECORD(FILE_SYSTEM_OPTIONS);
   RECORD(HEADER_SEARCH_OPTIONS);
@@ -1439,7 +1440,8 @@ void ASTWriter::writeUnhashedControlBlock(Preprocessor &PP) {
 }
 
 /// Write the control block.
-void ASTWriter::WriteControlBlock(Preprocessor &PP, StringRef isysroot) {
+void ASTWriter::WriteControlBlock(Preprocessor &PP, StringRef isysroot,
+                                  Sema *SemaPtr) {
   using namespace llvm;
 
   SourceManager &SourceMgr = PP.getSourceManager();
@@ -1671,6 +1673,13 @@ void ASTWriter::WriteControlBlock(Preprocessor &PP, StringRef isysroot) {
 #define ENUM_DEBUGOPT(Name, Type, Bits, Default, Compatibility)
 #include "clang/Basic/CodeGenOptions.def"
   Stream.EmitRecord(CODEGEN_OPTIONS, Record);
+
+  // The Swift version API notes were applied at, if it made a difference.
+  if (SemaPtr && SemaPtr->APINotes.appliedVersionedAPINotes()) {
+    Record.clear();
+    AddVersionTuple(SemaPtr->APINotes.getSwiftVersion(), Record);
+    Stream.EmitRecord(API_NOTES_OPTIONS, Record);
+  }
 
   // Target options.
   Record.clear();
@@ -6168,7 +6177,7 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
     PrepareWritingSpecialDecls(*SemaPtr);
 
   // Write the control block
-  WriteControlBlock(*PP, isysroot);
+  WriteControlBlock(*PP, isysroot, SemaPtr);
 
   // Write the remaining AST contents.
   Stream.FlushToWord();

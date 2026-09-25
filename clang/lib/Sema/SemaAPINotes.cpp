@@ -1130,8 +1130,14 @@ static void ProcessVersionedAPINotes(
     const api_notes::APINotesReader::VersionedInfo<SpecificInfo> &Info,
     unsigned SliceGroup) {
 
-  if (!S.captureSwiftVersionIndependentAPINotes())
+  if (!S.captureSwiftVersionIndependentAPINotes()) {
     maybeAttachUnversionedSwiftName(S, D, Info, SliceGroup);
+    if (Info.size() != 0 &&
+        llvm::any_of(Info, [](const auto &VersionAndInfoSlice) {
+          return !VersionAndInfoSlice.first.empty();
+        }))
+      S.APINotes.noteAppliedVersionedAPINotes();
+  }
 
   unsigned Selected = Info.getSelected().value_or(Info.size());
 

@@ -147,6 +147,11 @@ public:
     return false;
   }
 
+  /// Receives the Swift version the AST file applied API notes at, if they
+  /// differed by version.
+  virtual void ReadAPINotesSwiftVersion(llvm::VersionTuple Version,
+                                        StringRef ModuleFilename) {}
+
   /// Receives the target options.
   ///
   /// \returns true to indicate the target options are invalid, or false
@@ -295,6 +300,8 @@ public:
   bool ReadCodeGenOptions(const CodeGenOptions &CGOpts,
                           StringRef ModuleFilename, bool Complain,
                           bool AllowCompatibleDifferences) override;
+  void ReadAPINotesSwiftVersion(llvm::VersionTuple Version,
+                                StringRef ModuleFilename) override;
   bool ReadTargetOptions(const TargetOptions &TargetOpts,
                          StringRef ModuleFilename, bool Complain,
                          bool AllowCompatibleDifferences) override;
@@ -338,6 +345,8 @@ public:
   bool ReadCodeGenOptions(const CodeGenOptions &CGOpts,
                           StringRef ModuleFilename, bool Complain,
                           bool AllowCompatibleDifferences) override;
+  void ReadAPINotesSwiftVersion(llvm::VersionTuple Version,
+                                StringRef ModuleFilename) override;
   bool ReadTargetOptions(const TargetOptions &TargetOpts,
                          StringRef ModuleFilename, bool Complain,
                          bool AllowCompatibleDifferences) override;
