@@ -902,6 +902,7 @@ void ASTWriter::WriteBlockInfoBlock() {
   RECORD(ORIGINAL_FILE);
   RECORD(ORIGINAL_FILE_ID);
   RECORD(INPUT_FILE_OFFSETS);
+  RECORD(API_NOTES_SWIFT_VERSION);
 
   BLOCK(OPTIONS_BLOCK);
   RECORD(LANGUAGE_OPTIONS);
@@ -1439,7 +1440,8 @@ void ASTWriter::writeUnhashedControlBlock(Preprocessor &PP) {
 }
 
 /// Write the control block.
-void ASTWriter::WriteControlBlock(Preprocessor &PP, StringRef isysroot) {
+void ASTWriter::WriteControlBlock(Preprocessor &PP, StringRef isysroot,
+                                  Sema *SemaPtr) {
   using namespace llvm;
 
   SourceManager &SourceMgr = PP.getSourceManager();
@@ -1762,6 +1764,23 @@ void ASTWriter::WriteControlBlock(Preprocessor &PP, StringRef isysroot) {
 
   // Leave the options block.
   Stream.ExitBlock();
+
+  // The Swift version API notes were applied at, and the versions that select
+  // the same slices, if a slice made a difference to what this file holds:
+  // one this compilation applied, or one its reader collapsed.
+  if (SemaPtr) {
+    api_notes::SwiftVersionRange SameSelection =
+        SemaPtr->APINotes.getAppliedSelection();
+    if (Chain)
+      SameSelection.intersect(Chain->getCollapsedAPINotesSelection());
+    if (SameSelection.isBounded()) {
+      Record.clear();
+      AddVersionTuple(SemaPtr->APINotes.getSwiftVersion(), Record);
+      AddVersionTuple(SameSelection.above().value_or(VersionTuple()), Record);
+      AddVersionTuple(SameSelection.upTo().value_or(VersionTuple()), Record);
+      Stream.EmitRecord(API_NOTES_SWIFT_VERSION, Record);
+    }
+  }
 
   // Original file name and file ID
   if (auto MainFile =
@@ -6168,7 +6187,7 @@ ASTFileSignature ASTWriter::WriteASTCore(Sema *SemaPtr, StringRef isysroot,
     PrepareWritingSpecialDecls(*SemaPtr);
 
   // Write the control block
-  WriteControlBlock(*PP, isysroot);
+  WriteControlBlock(*PP, isysroot, SemaPtr);
 
   // Write the remaining AST contents.
   Stream.FlushToWord();

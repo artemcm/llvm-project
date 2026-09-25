@@ -351,6 +351,7 @@ void VerifyPCHAction::ExecuteAction() {
       /*AllowASTWithCompilerErrors*/ false,
       /*AllowConfigurationMismatch*/ true,
       /*ValidateSystemInputs*/ true, /*ForceValidateUserInputs*/ true));
+  Reader->setAPINotesSwiftVersion(CI.getAPINotesCollapseVersion());
 
   Reader->ReadAST(ModuleFileName::makeExplicit(getCurrentFile()),
                   Preamble ? serialization::MK_Preamble : serialization::MK_PCH,

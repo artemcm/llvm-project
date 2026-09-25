@@ -1702,9 +1702,13 @@ public:
   /// \param Undo If given, records what the collapse replaces, of \p D and of
   /// what it merged in, so that a producer that collapses to see a declaration
   /// as an importer would can put everything back.
-  static void CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
-                                        VersionTuple Requested,
-                                        APINotesCollapseUndo *Undo = nullptr);
+  ///
+  /// \returns The Swift versions at which the collapse selects the same
+  /// slices.
+  static api_notes::SwiftVersionRange
+  CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
+                            VersionTuple Requested,
+                            APINotesCollapseUndo *Undo = nullptr);
 
   /// Whether \p D, or one of its parameters, carries API notes captured under
   /// -fswift-version-independent-apinotes: slices, or merges that wait for

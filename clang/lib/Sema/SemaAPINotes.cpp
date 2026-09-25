@@ -1136,8 +1136,11 @@ static void ProcessVersionedAPINotes(
     const api_notes::APINotesReader::VersionedInfo<SpecificInfo> Info,
     unsigned SliceGroup) {
 
-  if (!S.captureSwiftVersionIndependentAPINotes())
+  if (!S.captureSwiftVersionIndependentAPINotes()) {
     maybeAttachUnversionedSwiftName(S, D, Info, SliceGroup);
+    for (unsigned I = 0, N = Info.size(); I != N; ++I)
+      S.APINotes.noteAppliedSlice(Info[I].first);
+  }
 
   unsigned Selected = Info.getSelected().value_or(Info.size());
 
@@ -1771,12 +1774,16 @@ static bool hasCapturedAPINotesAttr(const Decl *D) {
 using SelectedSlices = llvm::SmallDenseMap<unsigned, VersionTuple, 8>;
 
 /// Selection, once per slice group, as APINotesReader::VersionedInfo's
-/// constructor makes it: see api_notes::isSliceSelectable.
-static SelectedSlices selectCapturedSlices(const Decl *D,
-                                           VersionTuple Requested) {
+/// constructor makes it: see api_notes::isSliceSelectable. If \p Range is
+/// given, narrow it to the versions that select the same.
+static SelectedSlices
+selectCapturedSlices(const Decl *D, VersionTuple Requested,
+                     api_notes::SwiftVersionRange *Range = nullptr) {
   SelectedSlices Selected;
   for (const auto *Marker : D->specific_attrs<SwiftVersionedSliceAttr>()) {
     const VersionTuple Version = Marker->getVersion();
+    if (Range)
+      Range->addSlice(Version, Requested);
     const bool Matches = api_notes::isSliceSelectable(Version, Requested);
     if (!Matches && !Version.empty())
       continue;
@@ -2312,6 +2319,7 @@ struct CollapseState {
   ASTContext &Context;
   VersionTuple Requested;
   APINotesCollapseUndo *Undo;
+  api_notes::SwiftVersionRange Selection;
   llvm::SmallPtrSet<const Decl *, 8> Started;
 };
 } // namespace
@@ -2362,7 +2370,7 @@ static void collapseDecl(CollapseState &State, Decl *D) {
     if (Undo)
       Undo->save(D);
     return replayCapturedSlices(
-        Context, D, selectCapturedSlices(D, State.Requested),
+        Context, D, selectCapturedSlices(D, State.Requested, &State.Selection),
         ReplayOptions{/*KeepsCaptured=*/Undo != nullptr});
   };
   const bool Replayed = hasCapturedAPINotesAttr(D);
@@ -2404,11 +2412,13 @@ static void collapseDecl(CollapseState &State, Decl *D) {
   }
 }
 
-void Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
-                                     VersionTuple Requested,
-                                     APINotesCollapseUndo *Undo) {
-  CollapseState State{Context, Requested, Undo, {}};
+api_notes::SwiftVersionRange
+Sema::CollapseVersionedAPINotes(ASTContext &Context, Decl *D,
+                                VersionTuple Requested,
+                                APINotesCollapseUndo *Undo) {
+  CollapseState State{Context, Requested, Undo, {}, {}};
   collapseDecl(State, D);
+  return State.Selection;
 }
 
 void APINotesCollapseUndo::save(Decl *D) {

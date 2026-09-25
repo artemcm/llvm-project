@@ -15,7 +15,9 @@
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/VersionTuple.h"
+#include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace clang {
@@ -37,6 +39,58 @@ inline bool isSliceSelectable(llvm::VersionTuple Slice,
                               llvm::VersionTuple Requested) {
   return !Requested.empty() && Slice >= Requested;
 }
+
+/// The Swift versions at which versioned API notes select what they select at
+/// the version a compilation requested: those above \c above(), if set, up to
+/// and including \c upTo(), if set.
+///
+/// A lookup selects its lowest versioned slice at or above the requested
+/// version, or else its unversioned slice. So its selection stays the same
+/// exactly where each of its versioned slices stays selectable, or stays not,
+/// and each slice narrows the range on its own.
+class SwiftVersionRange {
+  std::optional<llvm::VersionTuple> Above;
+  std::optional<llvm::VersionTuple> UpTo;
+
+public:
+  SwiftVersionRange() = default;
+  SwiftVersionRange(std::optional<llvm::VersionTuple> Above,
+                    std::optional<llvm::VersionTuple> UpTo)
+      : Above(Above), UpTo(UpTo) {}
+
+  std::optional<llvm::VersionTuple> above() const { return Above; }
+  std::optional<llvm::VersionTuple> upTo() const { return UpTo; }
+
+  /// Whether some versioned slice narrowed the range.
+  bool isBounded() const { return Above || UpTo; }
+
+  /// Narrow to the versions at which a slice for \p Slice is selectable if and
+  /// only if it is at \p Requested. An unversioned slice always is.
+  void addSlice(llvm::VersionTuple Slice, llvm::VersionTuple Requested) {
+    if (Slice.empty())
+      return;
+    if (isSliceSelectable(Slice, Requested))
+      intersect({std::nullopt, Slice});
+    else
+      intersect({Slice, std::nullopt});
+  }
+
+  /// Narrow to the versions \p Other contains too.
+  void intersect(const SwiftVersionRange &Other) {
+    if (Other.Above)
+      Above = Above ? std::max(*Above, *Other.Above) : *Other.Above;
+    if (Other.UpTo)
+      UpTo = UpTo ? std::min(*UpTo, *Other.UpTo) : *Other.UpTo;
+  }
+
+  /// Whether \p Version selects what the requested version does. Requesting
+  /// none selects no versioned slice, as a version above every slice would.
+  bool contains(llvm::VersionTuple Version) const {
+    if (Version.empty())
+      return !UpTo;
+    return (!Above || Version > *Above) && (!UpTo || Version <= *UpTo);
+  }
+};
 
 /// The API notes manager helps find API notes associated with declarations.
 ///
@@ -65,6 +119,9 @@ class APINotesManager {
 
   /// The Swift version to use when interpreting versioned API notes.
   llvm::VersionTuple SwiftVersion;
+
+  /// See noteAppliedSlice.
+  SwiftVersionRange AppliedSelection;
 
   enum ReaderKind : unsigned { Public = 0, Private = 1 };
 
@@ -134,6 +191,21 @@ public:
   /// Set the Swift version to use when filtering API notes.
   void setSwiftVersion(llvm::VersionTuple Version) {
     this->SwiftVersion = Version;
+  }
+
+  /// The Swift version to use when filtering API notes.
+  llvm::VersionTuple getSwiftVersion() const { return SwiftVersion; }
+
+  /// Record that a lookup this compilation applied had a slice for \p Slice,
+  /// so that what it produces depends on the versions that select alike.
+  void noteAppliedSlice(llvm::VersionTuple Slice) {
+    AppliedSelection.addSlice(Slice, SwiftVersion);
+  }
+
+  /// The Swift versions at which the API notes applied so far select what
+  /// they selected here.
+  const SwiftVersionRange &getAppliedSelection() const {
+    return AppliedSelection;
   }
 
   /// Load the API notes for the current module.

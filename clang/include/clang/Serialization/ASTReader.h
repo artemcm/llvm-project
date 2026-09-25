@@ -147,6 +147,13 @@ public:
     return false;
   }
 
+  /// Receives the Swift version the AST file applied API notes at, and the
+  /// versions that select the same slices, if its content depends on them.
+  virtual void
+  ReadAPINotesSwiftVersion(llvm::VersionTuple Version,
+                           const api_notes::SwiftVersionRange &SameSelection,
+                           StringRef ModuleFilename) {}
+
   /// Receives the target options.
   ///
   /// \returns true to indicate the target options are invalid, or false
@@ -295,6 +302,10 @@ public:
   bool ReadCodeGenOptions(const CodeGenOptions &CGOpts,
                           StringRef ModuleFilename, bool Complain,
                           bool AllowCompatibleDifferences) override;
+  void
+  ReadAPINotesSwiftVersion(llvm::VersionTuple Version,
+                           const api_notes::SwiftVersionRange &SameSelection,
+                           StringRef ModuleFilename) override;
   bool ReadTargetOptions(const TargetOptions &TargetOpts,
                          StringRef ModuleFilename, bool Complain,
                          bool AllowCompatibleDifferences) override;
@@ -338,6 +349,10 @@ public:
   bool ReadCodeGenOptions(const CodeGenOptions &CGOpts,
                           StringRef ModuleFilename, bool Complain,
                           bool AllowCompatibleDifferences) override;
+  void
+  ReadAPINotesSwiftVersion(llvm::VersionTuple Version,
+                           const api_notes::SwiftVersionRange &SameSelection,
+                           StringRef ModuleFilename) override;
   bool ReadTargetOptions(const TargetOptions &TargetOpts,
                          StringRef ModuleFilename, bool Complain,
                          bool AllowCompatibleDifferences) override;
@@ -1629,6 +1644,8 @@ private:
   /// The Swift version to collapse captured API notes slices at, or
   /// std::nullopt to leave them captured. See setAPINotesSwiftVersion.
   std::optional<VersionTuple> APINotesSwiftVersion = VersionTuple();
+  /// The Swift versions at which the collapses so far select the same slices.
+  api_notes::SwiftVersionRange CollapsedSelection;
   /// Collapse the API notes slices captured on a just-deserialized declaration,
   /// at the Swift version this compilation requests.
   void collapseVersionedAPINotes(Decl *D);
@@ -1963,6 +1980,12 @@ public:
   /// the file's, and the file says nothing about who is reading it.
   void setAPINotesSwiftVersion(std::optional<VersionTuple> Version) {
     APINotesSwiftVersion = Version;
+  }
+
+  /// The Swift versions at which the API notes this reader collapsed select
+  /// the same slices. What a compilation writes can depend on them.
+  const api_notes::SwiftVersionRange &getCollapsedAPINotesSelection() const {
+    return CollapsedSelection;
   }
 
   /// Determine whether this AST reader has a global index.

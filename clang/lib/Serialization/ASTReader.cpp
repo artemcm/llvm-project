@@ -187,6 +187,13 @@ bool ChainedASTReaderListener::ReadCodeGenOptions(
                                     AllowCompatibleDifferences);
 }
 
+void ChainedASTReaderListener::ReadAPINotesSwiftVersion(
+    VersionTuple Version, const api_notes::SwiftVersionRange &SameSelection,
+    StringRef ModuleFilename) {
+  First->ReadAPINotesSwiftVersion(Version, SameSelection, ModuleFilename);
+  Second->ReadAPINotesSwiftVersion(Version, SameSelection, ModuleFilename);
+}
+
 bool ChainedASTReaderListener::ReadTargetOptions(
     const TargetOptions &TargetOpts, StringRef ModuleFilename, bool Complain,
     bool AllowCompatibleDifferences) {
@@ -571,6 +578,26 @@ bool PCHValidator::ReadCodeGenOptions(const CodeGenOptions &CGOpts,
   return checkCodegenOptions(ExistingCGOpts, CGOpts, ModuleFilename,
                              Complain ? &Reader.Diags : nullptr,
                              AllowCompatibleDifferences);
+}
+
+void PCHValidator::ReadAPINotesSwiftVersion(
+    VersionTuple Version, const api_notes::SwiftVersionRange &SameSelection,
+    StringRef ModuleFilename) {
+  // The file shows every importer its declarations as that version sees them.
+  // That is only right for an importer at a version that selects the same
+  // slices: not for one at another, and not for one that captures API notes
+  // for every version. It does not make the file unusable, so this warns
+  // whether or not the caller tolerates a configuration mismatch.
+  const std::optional<VersionTuple> &Requested = Reader.APINotesSwiftVersion;
+  if (Requested && SameSelection.contains(*Requested))
+    return;
+  enum { RequestsVersion, RequestsNone, Captures };
+  Reader.Diag(diag::warn_ast_file_apinotes_swift_version)
+      << ModuleFilename << Version.empty() << Version.getAsString()
+      << (!Requested           ? Captures
+          : Requested->empty() ? RequestsNone
+                               : RequestsVersion)
+      << (Requested ? Requested->getAsString() : std::string());
 }
 
 bool PCHValidator::ReadTargetOptions(const TargetOptions &TargetOpts,
@@ -3698,6 +3725,22 @@ ASTReader::ReadControlBlock(ModuleFile &F,
       F.InputFileInfosLoaded.resize(NumInputs);
       F.NumUserInputFiles = NumUserInputs;
       break;
+
+    case API_NOTES_SWIFT_VERSION: {
+      if (!Listener)
+        break;
+      // No slice has an empty version, so an empty bound is none.
+      unsigned Idx = 0;
+      auto ReadBound = [&]() -> std::optional<VersionTuple> {
+        VersionTuple Bound = ReadVersionTuple(Record, Idx);
+        return Bound.empty() ? std::nullopt : std::optional(Bound);
+      };
+      const VersionTuple Version = ReadVersionTuple(Record, Idx);
+      const std::optional<VersionTuple> Above = ReadBound();
+      const std::optional<VersionTuple> UpTo = ReadBound();
+      Listener->ReadAPINotesSwiftVersion(Version, {Above, UpTo}, F.FileName);
+      break;
+    }
     }
   }
 }
@@ -8706,7 +8749,8 @@ void ASTReader::collapseVersionedAPINotes(Decl *D) {
     PendingAPINotesCollapses.push_back(D);
     return;
   }
-  Sema::CollapseVersionedAPINotes(getContext(), D, *APINotesSwiftVersion);
+  CollapsedSelection.intersect(
+      Sema::CollapseVersionedAPINotes(getContext(), D, *APINotesSwiftVersion));
 }
 
 LocalDeclID ASTReader::mapGlobalIDToModuleFileGlobalID(ModuleFile &M,
@@ -10764,7 +10808,8 @@ void ASTReader::finishPendingActions() {
     // What waited for a declaration it merged in collapses now, and the
     // collapse applies that one's notes first.
     for (Decl *D : std::exchange(PendingAPINotesCollapses, {}))
-      Sema::CollapseVersionedAPINotes(getContext(), D, *APINotesSwiftVersion);
+      CollapsedSelection.intersect(Sema::CollapseVersionedAPINotes(
+          getContext(), D, *APINotesSwiftVersion));
 
     // Load each variable type that we deferred loading because it was a
     // deduced type that might refer to a local type declared within itself.
